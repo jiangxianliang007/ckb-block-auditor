@@ -10,8 +10,6 @@ use ckb_block_auditor::{Auditor, AuditorConfig, HttpRpc};
 struct Args {
     #[arg(long, env = "CKB_RPC_URL", default_value = "http://127.0.0.1:8114")]
     rpc_url: String,
-    #[arg(long, env = "CKB_NETWORK", default_value = "mainnet")]
-    network: String,
     #[arg(long, env = "CKB_NODE_ID", default_value = "unknown")]
     node_id: String,
     #[arg(long, env = "CKB_POLL_INTERVAL_MS", default_value_t = 3000)]
@@ -20,8 +18,8 @@ struct Args {
     rpc_timeout_secs: u64,
     #[arg(long, env = "CKB_MAX_RETRIES", default_value_t = 2)]
     max_retries: u32,
-    #[arg(long, env = "CKB_CURSOR_PATH", default_value = "./data/cursor.json")]
-    cursor_path: PathBuf,
+    #[arg(long, env = "CKB_CURSOR_PATH")]
+    cursor_path: Option<std::path::PathBuf>,
     #[arg(long, env = "CKB_LOG_PATH")]
     log_path: Option<PathBuf>,
     #[arg(long, env = "CKB_MAX_DETAILS", default_value_t = 200)]
@@ -45,7 +43,6 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let cfg = AuditorConfig {
         rpc_url: args.rpc_url.clone(),
-        network: args.network,
         node_id: args.node_id,
         poll_interval_ms: args.poll_interval_ms,
         rpc_timeout_secs: args.rpc_timeout_secs,
@@ -68,4 +65,26 @@ async fn main() -> anyhow::Result<()> {
     )?);
     let auditor = Auditor::new(rpc, cfg);
     auditor.run().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::Parser;
+
+    #[test]
+    fn test_cli_cursor_path_is_optional_and_network_is_removed() {
+        let args =
+            Args::try_parse_from(["ckb-block-auditor", "--rpc-url", "http://localhost:8114"])
+                .unwrap();
+        assert!(args.cursor_path.is_none());
+    }
+
+    #[test]
+    fn test_cli_rejects_removed_network_flag() {
+        let err = Args::try_parse_from(["ckb-block-auditor", "--network", "mainnet"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--network"));
+    }
 }

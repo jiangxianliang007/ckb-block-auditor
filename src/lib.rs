@@ -25,12 +25,11 @@ use serde_json::json;
 #[derive(Debug, Clone)]
 pub struct AuditorConfig {
     pub rpc_url: String,
-    pub network: String,
     pub node_id: String,
     pub poll_interval_ms: u64,
     pub rpc_timeout_secs: u64,
     pub max_retries: u32,
-    pub cursor_path: PathBuf,
+    pub cursor_path: Option<PathBuf>,
     pub log_path: Option<PathBuf>,
     pub max_details: usize,
     pub max_future_ms: u64,
@@ -43,8 +42,11 @@ pub struct AuditorConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CursorState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genesis_hash: Option<String>,
     pub last_height: u64,
     pub last_hash: String,
+    #[serde(default)]
     pub history: BTreeMap<u64, String>,
 }
 
@@ -67,9 +69,31 @@ impl CursorState {
                 .await
                 .with_context(|| format!("failed to create cursor dir {}", parent.display()))?;
         }
-        tokio::fs::write(path, serde_json::to_vec_pretty(self)?)
+        let temp_name = format!(
+            ".{}.tmp-{}",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("cursor"),
+            std::process::id()
+        );
+        let temp_path = path.with_file_name(temp_name);
+        tokio::fs::write(&temp_path, serde_json::to_vec_pretty(self)?)
             .await
-            .with_context(|| format!("failed to write cursor file {}", path.display()))
+            .with_context(|| format!("failed to write temp cursor file {}", temp_path.display()))?;
+        tokio::fs::rename(&temp_path, path)
+            .await
+            .with_context(|| format!("failed to replace cursor file {}", path.display()))
+    }
+
+    fn new(genesis_hash: String, height: u64, hash: String, retention: usize) -> Self {
+        let mut state = Self {
+            genesis_hash: Some(genesis_hash),
+            last_height: height,
+            last_hash: hash.clone(),
+            history: BTreeMap::new(),
+        };
+        state.push_block(height, hash, retention);
+        state
     }
 
     fn push_block(&mut self, height: u64, hash: String, retention: usize) {
@@ -128,7 +152,7 @@ pub struct DetailItem {
 
 #[derive(Debug, Clone)]
 struct ConsensusSnapshot {
-    network_id: String,
+    consensus_id: String,
     genesis_hash: H256,
     dao_type_hash: H256,
     max_block_bytes: usize,
@@ -140,14 +164,6 @@ struct ConsensusSnapshot {
 
 impl ConsensusSnapshot {
     fn from_rpc(config: &AuditorConfig, consensus: RpcConsensus) -> Result<Self> {
-        let network_id = consensus.id.clone();
-        if !network_id.eq_ignore_ascii_case(&config.network) {
-            return Err(anyhow!(
-                "configured network '{}' does not match node consensus id '{}'",
-                config.network,
-                network_id
-            ));
-        }
         if !config.dao_type_hash.is_empty()
             && !format!("{:#x}", consensus.dao_type_hash)
                 .eq_ignore_ascii_case(&config.dao_type_hash)
@@ -160,7 +176,7 @@ impl ConsensusSnapshot {
         }
 
         Ok(Self {
-            network_id,
+            consensus_id: consensus.id.clone(),
             genesis_hash: consensus.genesis_hash,
             dao_type_hash: consensus.dao_type_hash,
             max_block_bytes: usize::try_from(consensus.max_block_bytes.value())
@@ -200,7 +216,6 @@ pub struct AuditLog {
     pub schema_version: u32,
     pub service: String,
     pub auditor_version: String,
-    pub network: String,
     pub node_id: String,
 
     pub block_height: u64,
@@ -293,45 +308,25 @@ pub struct AuditLog {
     #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_cycles: CheckStatus,
 
-    pub reward_verification_method: String,
-    pub dao_verification_method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reward_target_block_hash: Option<String>,
+    pub failed_checks: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reward_expected_amount: Option<String>,
+    pub unknown_checks: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reward_actual_amount: Option<String>,
-
-    pub tx_count: usize,
-    pub proposal_count: usize,
-    pub uncle_count: usize,
-    pub block_consensus_size_bytes: usize,
-    pub block_consensus_size_limit_bytes: usize,
-
-    pub capacity_eligible_tx_count: usize,
-    pub capacity_checked_tx_count: usize,
-    pub capacity_failed_tx_count: usize,
-    pub capacity_unchecked_tx_count: usize,
-    pub dao_related_tx_count: usize,
-    pub dao_checked_inputs_count: usize,
-    pub dao_unresolved_inputs_count: usize,
-    pub unresolved_input_count: usize,
-
-    pub failed_checks: Vec<String>,
-    pub unknown_checks: Vec<String>,
-    pub details_truncated: bool,
-    pub details_total: usize,
-    pub details: Vec<DetailItem>,
+    pub details_truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details_total: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<Vec<DetailItem>>,
 }
 
 impl AuditLog {
     fn new(config: &AuditorConfig, block: &BlockView) -> Self {
         Self {
             timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-            schema_version: 2,
+            schema_version: 3,
             service: "ckb-block-auditor".to_string(),
             auditor_version: env!("CARGO_PKG_VERSION").to_string(),
-            network: config.network.clone(),
             node_id: config.node_id.clone(),
             block_height: block.header.inner.number.value(),
             block_hash: format!("{:#x}", block.header.hash),
@@ -384,39 +379,22 @@ impl AuditLog {
             check_vm_scripts: CheckStatus::NotImplemented,
             check_cycles: CheckStatus::NotImplemented,
 
-            reward_verification_method: "node_rpc_consistency".to_string(),
-            dao_verification_method: "node_rpc_consistency".to_string(),
-            reward_target_block_hash: None,
-            reward_expected_amount: None,
-            reward_actual_amount: None,
-
-            tx_count: block.transactions.len(),
-            proposal_count: block.proposals.len(),
-            uncle_count: block.uncles.len(),
-            block_consensus_size_bytes: 0,
-            block_consensus_size_limit_bytes: 0,
-            capacity_eligible_tx_count: 0,
-            capacity_checked_tx_count: 0,
-            capacity_failed_tx_count: 0,
-            capacity_unchecked_tx_count: 0,
-            dao_related_tx_count: 0,
-            dao_checked_inputs_count: 0,
-            dao_unresolved_inputs_count: 0,
-            unresolved_input_count: 0,
-            failed_checks: vec![],
-            unknown_checks: vec![],
-            details_truncated: false,
-            details_total: 0,
-            details: vec![],
+            failed_checks: None,
+            unknown_checks: None,
+            details_truncated: None,
+            details_total: None,
+            details: None,
         }
     }
 
     fn push_detail(&mut self, config: &AuditorConfig, item: DetailItem) {
-        self.details_total += 1;
-        if self.details.len() < config.max_details {
-            self.details.push(item);
+        let total = self.details_total.get_or_insert(0);
+        *total += 1;
+        let details = self.details.get_or_insert_with(Vec::new);
+        if details.len() < config.max_details {
+            details.push(item);
         } else {
-            self.details_truncated = true;
+            self.details_truncated = Some(true);
         }
     }
 
@@ -504,26 +482,43 @@ impl AuditLog {
             ("check_cycles", self.check_cycles),
         ];
 
-        self.failed_checks = checks
+        let failed_checks: Vec<String> = checks
             .iter()
             .filter_map(|(name, status)| {
                 (*status == CheckStatus::Fail).then_some((*name).to_string())
             })
             .collect();
-        self.unknown_checks = checks
+        let unknown_checks: Vec<String> = checks
             .iter()
             .filter_map(|(name, status)| {
                 (*status == CheckStatus::Unknown).then_some((*name).to_string())
             })
             .collect();
 
-        self.result = if !self.failed_checks.is_empty() {
+        self.failed_checks = (!failed_checks.is_empty()).then_some(failed_checks);
+        self.unknown_checks = (!unknown_checks.is_empty()).then_some(unknown_checks);
+        if self.details_total.unwrap_or(0) > 0 {
+            self.details_truncated.get_or_insert(false);
+            self.details.get_or_insert_with(Vec::new);
+        } else {
+            self.details = None;
+            self.details_total = None;
+            self.details_truncated = None;
+        }
+
+        self.result = if self.failed_checks.is_some() {
             AuditResult::Fail
-        } else if !self.unknown_checks.is_empty() {
+        } else if self.unknown_checks.is_some() {
             AuditResult::Incomplete
         } else {
             AuditResult::PassWithinScope
         };
+    }
+
+    fn has_detail_for(&self, check_name: &str) -> bool {
+        self.details
+            .as_ref()
+            .is_some_and(|details| details.iter().any(|detail| detail.check_name == check_name))
     }
 }
 
@@ -724,7 +719,7 @@ impl<R: CkbRpc> Auditor<R> {
     }
 
     pub async fn run(&self) -> Result<()> {
-        let mut cursor = CursorState::load(&self.config.cursor_path).await?;
+        let mut cursor = self.load_cursor().await?;
         loop {
             if let Err(err) = self.poll_once(&mut cursor).await {
                 eprintln!("poll error: {err:#}");
@@ -739,7 +734,68 @@ impl<R: CkbRpc> Auditor<R> {
         }
     }
 
+    async fn load_cursor(&self) -> Result<Option<CursorState>> {
+        match &self.config.cursor_path {
+            Some(path) => CursorState::load(path).await,
+            None => Ok(None),
+        }
+    }
+
+    async fn save_cursor(&self, state: &CursorState) -> Result<()> {
+        if let Some(path) = &self.config.cursor_path {
+            state.save(path).await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_cursor_genesis(
+        &self,
+        cursor: &mut CursorState,
+        consensus: &ConsensusSnapshot,
+    ) -> Result<bool> {
+        let actual_genesis = format!("{:#x}", consensus.genesis_hash);
+        match cursor.genesis_hash.as_deref() {
+            Some(saved) if saved.eq_ignore_ascii_case(&actual_genesis) => Ok(false),
+            Some(saved) => Err(anyhow!(
+                "cursor genesis hash '{}' does not match selected rpc genesis '{}' (consensus id '{}')",
+                saved,
+                actual_genesis,
+                consensus.consensus_id
+            )),
+            None => {
+                if cursor.history.is_empty() {
+                    return Err(anyhow!(
+                        "legacy cursor file is missing genesis_hash and cannot be migrated safely without canonical history; use a fresh cursor file for this rpc"
+                    ));
+                }
+                for (height, expected_hash) in &cursor.history {
+                    let Some(header) = self.rpc.get_header_by_number(*height).await? else {
+                        return Err(anyhow!(
+                            "legacy cursor file is missing genesis_hash and cannot be migrated safely because height {} is unavailable from the selected rpc; use a fresh cursor file",
+                            height
+                        ));
+                    };
+                    let actual_hash = format!("{:#x}", header.hash);
+                    if !actual_hash.eq_ignore_ascii_case(expected_hash) {
+                        return Err(anyhow!(
+                            "legacy cursor file is missing genesis_hash and cannot be migrated safely because recorded height {} hash '{}' does not match selected rpc hash '{}'; use a fresh cursor file",
+                            height,
+                            expected_hash,
+                            actual_hash
+                        ));
+                    }
+                }
+                cursor.genesis_hash = Some(actual_genesis);
+                Ok(true)
+            }
+        }
+    }
+
     async fn poll_once(&self, cursor: &mut Option<CursorState>) -> Result<()> {
+        let consensus = self
+            .consensus()
+            .await
+            .context("consensus prerequisite failed")?;
         let tip = self
             .rpc
             .get_tip_header()
@@ -747,27 +803,17 @@ impl<R: CkbRpc> Auditor<R> {
             .ok_or_else(|| anyhow!("tip header missing"))?;
 
         let tip_height = tip.inner.number.value();
-        let tip_hash = format!("{:#x}", tip.hash);
-
-        if cursor.is_none() {
-            let mut state = CursorState {
-                last_height: tip_height,
-                last_hash: tip_hash,
-                history: BTreeMap::new(),
-            };
-            state.push_block(
-                tip_height,
-                state.last_hash.clone(),
-                self.config.history_retention,
-            );
-            state.save(&self.config.cursor_path).await?;
-            *cursor = Some(state);
-            eprintln!("first startup anchored at tip height {}", tip_height);
-            return Ok(());
+        if let Some(state) = cursor.as_mut()
+            && self.ensure_cursor_genesis(state, &consensus).await?
+        {
+            self.save_cursor(state).await?;
         }
 
-        let state = cursor.as_mut().expect("cursor exists");
-        let start_height = self.resolve_common_ancestor(state).await? + 1;
+        let start_height = if let Some(state) = cursor.as_ref() {
+            self.resolve_common_ancestor(state).await? + 1
+        } else {
+            tip_height
+        };
         if tip_height < start_height {
             return Ok(());
         }
@@ -777,12 +823,24 @@ impl<R: CkbRpc> Auditor<R> {
                 eprintln!("missing block at height {height}, stop this round");
                 break;
             };
-            let log = self.audit_block(&block).await;
+            let log = self.audit_block_with_consensus(&block, &consensus).await;
             let line = serde_json::to_string(&log)?;
             self.sink.write_json_line(&line)?;
             let hash = format!("{:#x}", block.header.hash);
-            state.push_block(height, hash, self.config.history_retention);
-            state.save(&self.config.cursor_path).await?;
+            if let Some(state) = cursor.as_mut() {
+                state.push_block(height, hash, self.config.history_retention);
+                self.save_cursor(state).await?;
+            } else {
+                let state = CursorState::new(
+                    format!("{:#x}", consensus.genesis_hash),
+                    height,
+                    hash,
+                    self.config.history_retention,
+                );
+                self.save_cursor(&state).await?;
+                *cursor = Some(state);
+                eprintln!("initialized cursor at audited tip height {}", height);
+            }
         }
 
         Ok(())
@@ -864,7 +922,157 @@ impl<R: CkbRpc> Auditor<R> {
         );
     }
 
+    fn backfill_anomaly_details(&self, log: &mut AuditLog) {
+        for (check_name, status) in [
+            ("check_block_height", log.check_block_height),
+            ("check_parent_hash", log.check_parent_hash),
+            ("check_epoch_continuity", log.check_epoch_continuity),
+            ("check_timestamp", log.check_timestamp),
+            ("check_block_size", log.check_block_size),
+            ("check_proposal_limit", log.check_proposal_limit),
+            ("check_block_hash", log.check_block_hash),
+            ("check_transaction_hashes", log.check_transaction_hashes),
+            ("check_transactions_root", log.check_transactions_root),
+            ("check_proposals_hash", log.check_proposals_hash),
+            ("check_extra_hash", log.check_extra_hash),
+            (
+                "check_duplicate_transactions",
+                log.check_duplicate_transactions,
+            ),
+            ("check_duplicate_proposals", log.check_duplicate_proposals),
+            ("check_cellbase_structure", log.check_cellbase_structure),
+            ("check_transaction_version", log.check_transaction_version),
+            (
+                "check_inputs_outputs_structure",
+                log.check_inputs_outputs_structure,
+            ),
+            ("check_outputs_data_length", log.check_outputs_data_length),
+            (
+                "check_output_lock_hash_type",
+                log.check_output_lock_hash_type,
+            ),
+            ("check_duplicate_cell_deps", log.check_duplicate_cell_deps),
+            (
+                "check_duplicate_header_deps",
+                log.check_duplicate_header_deps,
+            ),
+            (
+                "check_duplicate_inputs_in_transaction",
+                log.check_duplicate_inputs_in_transaction,
+            ),
+            (
+                "check_duplicate_inputs_in_block",
+                log.check_duplicate_inputs_in_block,
+            ),
+            (
+                "check_input_content_resolution",
+                log.check_input_content_resolution,
+            ),
+            ("check_input_output_index", log.check_input_output_index),
+            ("check_occupied_capacity", log.check_occupied_capacity),
+            (
+                "check_ordinary_capacity_conservation",
+                log.check_ordinary_capacity_conservation,
+            ),
+            (
+                "check_cellbase_reward_amount",
+                log.check_cellbase_reward_amount,
+            ),
+            (
+                "check_cellbase_reward_target",
+                log.check_cellbase_reward_target,
+            ),
+            (
+                "check_dao_withdraw_capacity",
+                log.check_dao_withdraw_capacity,
+            ),
+        ] {
+            if matches!(status, CheckStatus::Fail | CheckStatus::Unknown)
+                && !log.has_detail_for(check_name)
+            {
+                let (error_code, reason) = match status {
+                    CheckStatus::Fail => ("CHECK_FAILED", format!("{check_name} failed")),
+                    CheckStatus::Unknown => (
+                        "CHECK_INCOMPLETE",
+                        format!("{check_name} could not be completed with the available rpc data"),
+                    ),
+                    _ => continue,
+                };
+                log.push_detail(
+                    &self.config,
+                    DetailItem {
+                        check_name: check_name.to_string(),
+                        status,
+                        error_code: error_code.to_string(),
+                        tx_hash: None,
+                        tx_index: None,
+                        input_index: None,
+                        output_index: None,
+                        referenced_out_point: None,
+                        expected_operator: None,
+                        expected_value: None,
+                        actual_value: None,
+                        unit: None,
+                        reason,
+                    },
+                );
+            }
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn audit_block(&self, block: &BlockView) -> AuditLog {
+        match self.consensus().await {
+            Ok(consensus) => self.audit_block_with_consensus(block, &consensus).await,
+            Err(err) => {
+                let started = Instant::now();
+                let mut log = AuditLog::new(&self.config, block);
+                log.canonical_at_audit = matches!(
+                    self.rpc
+                        .get_header_by_number(block.header.inner.number.value())
+                        .await,
+                    Ok(Some(current)) if current.hash == block.header.hash
+                );
+                let core_block: CoreBlockView = block.clone().into();
+
+                self.audit_header_and_block(block, &core_block, &mut log, None)
+                    .await;
+                self.audit_transactions(block, &core_block, &mut log, None)
+                    .await;
+                self.audit_reward(block, &mut log, None).await;
+
+                let reason = format!("get_consensus unavailable: {err}");
+                for check_name in [
+                    "check_timestamp",
+                    "check_block_size",
+                    "check_proposal_limit",
+                    "check_transaction_version",
+                    "check_ordinary_capacity_conservation",
+                    "check_cellbase_reward_amount",
+                    "check_cellbase_reward_target",
+                    "check_dao_withdraw_capacity",
+                ] {
+                    self.push_unknown_detail(
+                        &mut log,
+                        check_name,
+                        "CONSENSUS_UNAVAILABLE",
+                        reason.clone(),
+                    );
+                }
+
+                self.backfill_anomaly_details(&mut log);
+                log.audit_duration_ms = started.elapsed().as_millis() as u64;
+                log.finalize();
+                log
+            }
+        }
+    }
+
+    async fn audit_block_with_consensus(
+        &self,
+        block: &BlockView,
+        consensus: &ConsensusSnapshot,
+    ) -> AuditLog {
         let started = Instant::now();
         let mut log = AuditLog::new(&self.config, block);
         log.canonical_at_audit = matches!(
@@ -874,51 +1082,12 @@ impl<R: CkbRpc> Auditor<R> {
             Ok(Some(current)) if current.hash == block.header.hash
         );
         let core_block: CoreBlockView = block.clone().into();
-        let consensus = self.consensus().await;
-
-        self.audit_header_and_block(block, &core_block, &mut log, consensus.as_ref().ok())
+        self.audit_header_and_block(block, &core_block, &mut log, Some(consensus))
             .await;
-        self.audit_transactions(block, &core_block, &mut log, consensus.as_ref().ok())
+        self.audit_transactions(block, &core_block, &mut log, Some(consensus))
             .await;
-        self.audit_reward(block, &mut log, consensus.as_ref().ok())
-            .await;
-
-        if let Err(err) = &consensus {
-            let reason = format!("get_consensus unavailable: {err}");
-            log.check_timestamp = merge_status(log.check_timestamp, CheckStatus::Unknown);
-            log.check_block_size = merge_status(log.check_block_size, CheckStatus::Unknown);
-            log.check_proposal_limit = merge_status(log.check_proposal_limit, CheckStatus::Unknown);
-            log.check_transaction_version =
-                merge_status(log.check_transaction_version, CheckStatus::Unknown);
-            log.check_ordinary_capacity_conservation = merge_status(
-                log.check_ordinary_capacity_conservation,
-                CheckStatus::Unknown,
-            );
-            log.check_cellbase_reward_amount =
-                merge_status(log.check_cellbase_reward_amount, CheckStatus::Unknown);
-            log.check_cellbase_reward_target =
-                merge_status(log.check_cellbase_reward_target, CheckStatus::Unknown);
-            log.check_dao_withdraw_capacity =
-                merge_status(log.check_dao_withdraw_capacity, CheckStatus::Unknown);
-            for check_name in [
-                "check_timestamp",
-                "check_block_size",
-                "check_proposal_limit",
-                "check_transaction_version",
-                "check_ordinary_capacity_conservation",
-                "check_cellbase_reward_amount",
-                "check_cellbase_reward_target",
-                "check_dao_withdraw_capacity",
-            ] {
-                self.push_unknown_detail(
-                    &mut log,
-                    check_name,
-                    "CONSENSUS_UNAVAILABLE",
-                    reason.clone(),
-                );
-            }
-        }
-
+        self.audit_reward(block, &mut log, Some(consensus)).await;
+        self.backfill_anomaly_details(&mut log);
         log.audit_duration_ms = started.elapsed().as_millis() as u64;
         log.finalize();
         log
@@ -971,6 +1140,29 @@ impl<R: CkbRpc> Auditor<R> {
                         log.check_parent_hash = CheckStatus::Pass;
                     } else {
                         log.check_parent_hash = CheckStatus::Fail;
+                        log.push_detail(
+                            &self.config,
+                            DetailItem {
+                                check_name: "check_parent_hash".to_string(),
+                                status: CheckStatus::Fail,
+                                error_code: "PARENT_HASH_MISMATCH".to_string(),
+                                tx_hash: None,
+                                tx_index: None,
+                                input_index: None,
+                                output_index: None,
+                                referenced_out_point: None,
+                                expected_operator: Some("equal".to_string()),
+                                expected_value: Some(format!(
+                                    "{:#x}",
+                                    block.header.inner.parent_hash
+                                )),
+                                actual_value: Some(format!("{parent_recomputed:#x}")),
+                                unit: Some("hash".to_string()),
+                                reason:
+                                    "block parent_hash must match the recomputed parent header hash"
+                                        .to_string(),
+                            },
+                        );
                     }
 
                     let (ok, reason) = epoch_continuity(
@@ -1042,6 +1234,28 @@ impl<R: CkbRpc> Auditor<R> {
                                 log.check_timestamp = CheckStatus::Pass;
                             } else {
                                 log.check_timestamp = CheckStatus::Fail;
+                                log.push_detail(
+                                    &self.config,
+                                    DetailItem {
+                                        check_name: "check_timestamp".to_string(),
+                                        status: CheckStatus::Fail,
+                                        error_code: "TIMESTAMP_OUT_OF_RANGE".to_string(),
+                                        tx_hash: None,
+                                        tx_index: None,
+                                        input_index: None,
+                                        output_index: None,
+                                        referenced_out_point: None,
+                                        expected_operator: Some("greater_than_median_and_not_too_future".to_string()),
+                                        expected_value: Some(format!(
+                                            "median={} max_future={}",
+                                            median,
+                                            now_ms.saturating_add(self.config.max_future_ms)
+                                        )),
+                                        actual_value: Some(ts.to_string()),
+                                        unit: Some("ms".to_string()),
+                                        reason: "block timestamp must be greater than the ancestor median and not exceed the configured future allowance".to_string(),
+                                    },
+                                );
                             }
                         } else {
                             log.check_timestamp = CheckStatus::Unknown;
@@ -1058,6 +1272,12 @@ impl<R: CkbRpc> Auditor<R> {
                         }
                     } else {
                         log.check_timestamp = CheckStatus::Unknown;
+                        self.push_unknown_detail(
+                            log,
+                            "check_timestamp",
+                            "CONSENSUS_UNAVAILABLE",
+                            "timestamp validation requires get_consensus parameters".to_string(),
+                        );
                     }
                 }
                 Ok(None) => {
@@ -1065,6 +1285,22 @@ impl<R: CkbRpc> Auditor<R> {
                     log.check_parent_hash = CheckStatus::Unknown;
                     log.check_epoch_continuity = CheckStatus::Unknown;
                     log.check_timestamp = CheckStatus::Unknown;
+                    for check_name in [
+                        "check_block_height",
+                        "check_parent_hash",
+                        "check_epoch_continuity",
+                        "check_timestamp",
+                    ] {
+                        self.push_unknown_detail(
+                            log,
+                            check_name,
+                            "PARENT_HEADER_MISSING",
+                            format!(
+                                "parent header {:#x} is unavailable",
+                                block.header.inner.parent_hash
+                            ),
+                        );
+                    }
                 }
                 Err(err) => {
                     let reason = format!("parent header rpc failed: {err}");
@@ -1103,17 +1339,53 @@ impl<R: CkbRpc> Auditor<R> {
 
         let block_data: packed::Block = core_block.data();
         let actual_block_size = block_data.serialized_size_without_uncle_proposals();
-        log.block_consensus_size_bytes = actual_block_size;
         if let Some(consensus) = consensus {
-            log.block_consensus_size_limit_bytes = consensus.max_block_bytes;
-            log.check_block_size = if actual_block_size <= log.block_consensus_size_limit_bytes {
+            log.check_block_size = if actual_block_size <= consensus.max_block_bytes {
                 CheckStatus::Pass
             } else {
+                log.push_detail(
+                    &self.config,
+                    DetailItem {
+                        check_name: "check_block_size".to_string(),
+                        status: CheckStatus::Fail,
+                        error_code: "BLOCK_SIZE_EXCEEDED".to_string(),
+                        tx_hash: None,
+                        tx_index: None,
+                        input_index: None,
+                        output_index: None,
+                        referenced_out_point: None,
+                        expected_operator: Some("less_than_or_equal".to_string()),
+                        expected_value: Some(consensus.max_block_bytes.to_string()),
+                        actual_value: Some(actual_block_size.to_string()),
+                        unit: Some("byte".to_string()),
+                        reason: "block serialized size exceeds the consensus max_block_bytes limit"
+                            .to_string(),
+                    },
+                );
                 CheckStatus::Fail
             };
             log.check_proposal_limit = if block.proposals.len() <= consensus.proposal_limit {
                 CheckStatus::Pass
             } else {
+                log.push_detail(
+                    &self.config,
+                    DetailItem {
+                        check_name: "check_proposal_limit".to_string(),
+                        status: CheckStatus::Fail,
+                        error_code: "PROPOSAL_LIMIT_EXCEEDED".to_string(),
+                        tx_hash: None,
+                        tx_index: None,
+                        input_index: None,
+                        output_index: None,
+                        referenced_out_point: None,
+                        expected_operator: Some("less_than_or_equal".to_string()),
+                        expected_value: Some(consensus.proposal_limit.to_string()),
+                        actual_value: Some(block.proposals.len().to_string()),
+                        unit: Some("proposal".to_string()),
+                        reason: "proposal count exceeds the consensus max_block_proposals_limit"
+                            .to_string(),
+                    },
+                );
                 CheckStatus::Fail
             };
         } else {
@@ -1125,17 +1397,60 @@ impl<R: CkbRpc> Auditor<R> {
         log.check_block_hash = if computed_header_hash == block.header.hash {
             CheckStatus::Pass
         } else {
+            log.push_detail(
+                &self.config,
+                DetailItem {
+                    check_name: "check_block_hash".to_string(),
+                    status: CheckStatus::Fail,
+                    error_code: "BLOCK_HASH_MISMATCH".to_string(),
+                    tx_hash: None,
+                    tx_index: None,
+                    input_index: None,
+                    output_index: None,
+                    referenced_out_point: None,
+                    expected_operator: Some("equal".to_string()),
+                    expected_value: Some(format!("{:#x}", block.header.hash)),
+                    actual_value: Some(format!("{computed_header_hash:#x}")),
+                    unit: Some("hash".to_string()),
+                    reason:
+                        "recomputed block header hash does not match the rpc-provided block hash"
+                            .to_string(),
+                },
+            );
             CheckStatus::Fail
         };
 
         let computed_tx_hashes = block_data.calc_tx_hashes();
-        let tx_hash_status = computed_tx_hashes
+        let mut tx_hash_status = true;
+        for (tx_index, (computed, tx)) in computed_tx_hashes
             .iter()
             .zip(block.transactions.iter())
-            .all(|(computed, tx)| {
-                let computed: H256 = computed.unpack();
-                computed == tx.hash
-            });
+            .enumerate()
+        {
+            let computed: H256 = computed.unpack();
+            if computed != tx.hash {
+                tx_hash_status = false;
+                log.push_detail(
+                    &self.config,
+                    DetailItem {
+                        check_name: "check_transaction_hashes".to_string(),
+                        status: CheckStatus::Fail,
+                        error_code: "TRANSACTION_HASH_MISMATCH".to_string(),
+                        tx_hash: Some(format!("{:#x}", tx.hash)),
+                        tx_index: Some(tx_index),
+                        input_index: None,
+                        output_index: None,
+                        referenced_out_point: None,
+                        expected_operator: Some("equal".to_string()),
+                        expected_value: Some(format!("{:#x}", tx.hash)),
+                        actual_value: Some(format!("{computed:#x}")),
+                        unit: Some("hash".to_string()),
+                        reason: "recomputed transaction hash does not match the rpc-provided transaction hash"
+                            .to_string(),
+                    },
+                );
+            }
+        }
         log.check_transaction_hashes = if tx_hash_status {
             CheckStatus::Pass
         } else {
@@ -1143,17 +1458,55 @@ impl<R: CkbRpc> Auditor<R> {
         };
 
         let computed_transactions_root: H256 = core_block.calc_transactions_root().unpack();
-        log.check_transactions_root =
-            if computed_transactions_root == block.header.inner.transactions_root {
-                CheckStatus::Pass
-            } else {
-                CheckStatus::Fail
-            };
+        log.check_transactions_root = if computed_transactions_root
+            == block.header.inner.transactions_root
+        {
+            CheckStatus::Pass
+        } else {
+            log.push_detail(
+                &self.config,
+                DetailItem {
+                    check_name: "check_transactions_root".to_string(),
+                    status: CheckStatus::Fail,
+                    error_code: "TRANSACTIONS_ROOT_MISMATCH".to_string(),
+                    tx_hash: None,
+                    tx_index: None,
+                    input_index: None,
+                    output_index: None,
+                    referenced_out_point: None,
+                    expected_operator: Some("equal".to_string()),
+                    expected_value: Some(format!("{:#x}", block.header.inner.transactions_root)),
+                    actual_value: Some(format!("{computed_transactions_root:#x}")),
+                    unit: Some("hash".to_string()),
+                    reason: "recomputed transactions_root does not match the header field"
+                        .to_string(),
+                },
+            );
+            CheckStatus::Fail
+        };
 
         let computed_proposals_hash: H256 = block_data.calc_proposals_hash().unpack();
         log.check_proposals_hash = if computed_proposals_hash == block.header.inner.proposals_hash {
             CheckStatus::Pass
         } else {
+            log.push_detail(
+                &self.config,
+                DetailItem {
+                    check_name: "check_proposals_hash".to_string(),
+                    status: CheckStatus::Fail,
+                    error_code: "PROPOSALS_HASH_MISMATCH".to_string(),
+                    tx_hash: None,
+                    tx_index: None,
+                    input_index: None,
+                    output_index: None,
+                    referenced_out_point: None,
+                    expected_operator: Some("equal".to_string()),
+                    expected_value: Some(format!("{:#x}", block.header.inner.proposals_hash)),
+                    actual_value: Some(format!("{computed_proposals_hash:#x}")),
+                    unit: Some("hash".to_string()),
+                    reason: "recomputed proposals_hash does not match the header field".to_string(),
+                },
+            );
             CheckStatus::Fail
         };
 
@@ -1161,16 +1514,51 @@ impl<R: CkbRpc> Auditor<R> {
         log.check_extra_hash = if computed_extra_hash == block.header.inner.extra_hash {
             CheckStatus::Pass
         } else {
+            log.push_detail(
+                &self.config,
+                DetailItem {
+                    check_name: "check_extra_hash".to_string(),
+                    status: CheckStatus::Fail,
+                    error_code: "EXTRA_HASH_MISMATCH".to_string(),
+                    tx_hash: None,
+                    tx_index: None,
+                    input_index: None,
+                    output_index: None,
+                    referenced_out_point: None,
+                    expected_operator: Some("equal".to_string()),
+                    expected_value: Some(format!("{:#x}", block.header.inner.extra_hash)),
+                    actual_value: Some(format!("{computed_extra_hash:#x}")),
+                    unit: Some("hash".to_string()),
+                    reason: "recomputed extra_hash does not match the header field".to_string(),
+                },
+            );
             CheckStatus::Fail
         };
 
         let mut tx_hash_set = HashSet::new();
         let mut tx_dup = false;
-        for tx in &block.transactions {
+        for (tx_index, tx) in block.transactions.iter().enumerate() {
             let key = format!("{:#x}", tx.hash);
             if !tx_hash_set.insert(key) {
                 tx_dup = true;
-                break;
+                log.push_detail(
+                    &self.config,
+                    DetailItem {
+                        check_name: "check_duplicate_transactions".to_string(),
+                        status: CheckStatus::Fail,
+                        error_code: "DUPLICATE_TRANSACTION".to_string(),
+                        tx_hash: Some(format!("{:#x}", tx.hash)),
+                        tx_index: Some(tx_index),
+                        input_index: None,
+                        output_index: None,
+                        referenced_out_point: None,
+                        expected_operator: None,
+                        expected_value: None,
+                        actual_value: Some(format!("{:#x}", tx.hash)),
+                        unit: Some("hash".to_string()),
+                        reason: "duplicate transaction hash detected within block".to_string(),
+                    },
+                );
             }
         }
         log.check_duplicate_transactions = if tx_dup {
@@ -1181,11 +1569,29 @@ impl<R: CkbRpc> Auditor<R> {
 
         let mut proposal_set = HashSet::new();
         let mut proposal_dup = false;
-        for p in &block.proposals {
-            let key = format!("{p:?}");
+        for proposal_index in 0..block.proposals.len() {
+            let p = &block.proposals[proposal_index];
+            let key = p.0.to_vec();
             if !proposal_set.insert(key) {
                 proposal_dup = true;
-                break;
+                log.push_detail(
+                    &self.config,
+                    DetailItem {
+                        check_name: "check_duplicate_proposals".to_string(),
+                        status: CheckStatus::Fail,
+                        error_code: "DUPLICATE_PROPOSAL".to_string(),
+                        tx_hash: None,
+                        tx_index: None,
+                        input_index: None,
+                        output_index: Some(proposal_index),
+                        referenced_out_point: None,
+                        expected_operator: None,
+                        expected_value: None,
+                        actual_value: Some(hex::encode(p.0)),
+                        unit: Some("proposal".to_string()),
+                        reason: "duplicate proposal short id detected within block".to_string(),
+                    },
+                );
             }
         }
         log.check_duplicate_proposals = if proposal_dup {
@@ -1194,61 +1600,251 @@ impl<R: CkbRpc> Auditor<R> {
             CheckStatus::Pass
         };
 
-        log.check_cellbase_structure = self.check_cellbase_structure(block, consensus);
+        self.check_cellbase_structure(block, log);
     }
 
-    fn check_cellbase_structure(
-        &self,
-        block: &BlockView,
-        _consensus: Option<&ConsensusSnapshot>,
-    ) -> CheckStatus {
+    fn check_cellbase_structure(&self, block: &BlockView, log: &mut AuditLog) {
+        let mut status = CheckStatus::Pass;
         let Some(first_tx) = block.transactions.first() else {
-            return CheckStatus::Fail;
+            log.push_detail(
+                &self.config,
+                DetailItem {
+                    check_name: "check_cellbase_structure".to_string(),
+                    status: CheckStatus::Fail,
+                    error_code: "CELLBASE_MISSING".to_string(),
+                    tx_hash: None,
+                    tx_index: None,
+                    input_index: None,
+                    output_index: None,
+                    referenced_out_point: None,
+                    expected_operator: None,
+                    expected_value: None,
+                    actual_value: None,
+                    unit: None,
+                    reason: "block must contain a cellbase transaction at index 0".to_string(),
+                },
+            );
+            log.check_cellbase_structure = CheckStatus::Fail;
+            return;
         };
 
         let first_packed: packed::Transaction = first_tx.inner.clone().into();
         if !first_packed.is_cellbase() {
-            return CheckStatus::Fail;
+            status = CheckStatus::Fail;
+            log.push_detail(
+                &self.config,
+                DetailItem {
+                    check_name: "check_cellbase_structure".to_string(),
+                    status,
+                    error_code: "CELLBASE_FIRST_TRANSACTION_INVALID".to_string(),
+                    tx_hash: Some(format!("{:#x}", first_tx.hash)),
+                    tx_index: Some(0),
+                    input_index: None,
+                    output_index: None,
+                    referenced_out_point: None,
+                    expected_operator: None,
+                    expected_value: None,
+                    actual_value: None,
+                    unit: None,
+                    reason: "first transaction must be a valid cellbase".to_string(),
+                },
+            );
         }
 
-        if block.transactions.iter().skip(1).any(|tx| {
+        for (tx_index, tx) in block.transactions.iter().enumerate().skip(1) {
             let packed_tx: packed::Transaction = tx.inner.clone().into();
-            packed_tx.is_cellbase()
-        }) {
-            return CheckStatus::Fail;
+            if packed_tx.is_cellbase() {
+                status = CheckStatus::Fail;
+                log.push_detail(
+                    &self.config,
+                    DetailItem {
+                        check_name: "check_cellbase_structure".to_string(),
+                        status,
+                        error_code: "MULTIPLE_CELLBASE_TRANSACTIONS".to_string(),
+                        tx_hash: Some(format!("{:#x}", tx.hash)),
+                        tx_index: Some(tx_index),
+                        input_index: None,
+                        output_index: None,
+                        referenced_out_point: None,
+                        expected_operator: None,
+                        expected_value: None,
+                        actual_value: None,
+                        unit: None,
+                        reason: "only the first transaction may be cellbase".to_string(),
+                    },
+                );
+            }
         }
 
         if first_tx.inner.outputs.len() > 1
             || first_tx.inner.outputs_data.len() > 1
             || first_tx.inner.outputs.len() != first_tx.inner.outputs_data.len()
         {
-            return CheckStatus::Fail;
+            status = CheckStatus::Fail;
+            log.push_detail(
+                &self.config,
+                DetailItem {
+                    check_name: "check_cellbase_structure".to_string(),
+                    status,
+                    error_code: "CELLBASE_OUTPUT_STRUCTURE_INVALID".to_string(),
+                    tx_hash: Some(format!("{:#x}", first_tx.hash)),
+                    tx_index: Some(0),
+                    input_index: None,
+                    output_index: None,
+                    referenced_out_point: None,
+                    expected_operator: Some("single_output_with_matching_data".to_string()),
+                    expected_value: Some("outputs<=1 and outputs==outputs_data".to_string()),
+                    actual_value: Some(format!(
+                        "outputs={} outputs_data={}",
+                        first_tx.inner.outputs.len(),
+                        first_tx.inner.outputs_data.len()
+                    )),
+                    unit: None,
+                    reason:
+                        "cellbase must have at most one output and matching outputs_data length"
+                            .to_string(),
+                },
+            );
         }
 
         if let Some(input) = first_tx.inner.inputs.first() {
             let out_point: packed::OutPoint = input.previous_output.clone().into();
             if !out_point.is_null() {
-                return CheckStatus::Fail;
+                status = CheckStatus::Fail;
+                log.push_detail(
+                    &self.config,
+                    DetailItem {
+                        check_name: "check_cellbase_structure".to_string(),
+                        status,
+                        error_code: "CELLBASE_PREVIOUS_OUTPUT_NOT_NULL".to_string(),
+                        tx_hash: Some(format!("{:#x}", first_tx.hash)),
+                        tx_index: Some(0),
+                        input_index: Some(0),
+                        output_index: None,
+                        referenced_out_point: Some(format!(
+                            "{:#x}:{}",
+                            input.previous_output.tx_hash,
+                            input.previous_output.index.value()
+                        )),
+                        expected_operator: Some("equal".to_string()),
+                        expected_value: Some("null_out_point".to_string()),
+                        actual_value: None,
+                        unit: None,
+                        reason: "cellbase input previous_output must be null".to_string(),
+                    },
+                );
             }
             if input.since.value() != block.header.inner.number.value() {
-                return CheckStatus::Fail;
+                status = CheckStatus::Fail;
+                log.push_detail(
+                    &self.config,
+                    DetailItem {
+                        check_name: "check_cellbase_structure".to_string(),
+                        status,
+                        error_code: "CELLBASE_SINCE_MISMATCH".to_string(),
+                        tx_hash: Some(format!("{:#x}", first_tx.hash)),
+                        tx_index: Some(0),
+                        input_index: Some(0),
+                        output_index: None,
+                        referenced_out_point: None,
+                        expected_operator: Some("equal".to_string()),
+                        expected_value: Some(block.header.inner.number.value().to_string()),
+                        actual_value: Some(input.since.value().to_string()),
+                        unit: Some("block".to_string()),
+                        reason: "cellbase input since must equal the block number".to_string(),
+                    },
+                );
             }
         } else {
-            return CheckStatus::Fail;
+            status = CheckStatus::Fail;
+            log.push_detail(
+                &self.config,
+                DetailItem {
+                    check_name: "check_cellbase_structure".to_string(),
+                    status,
+                    error_code: "CELLBASE_INPUT_MISSING".to_string(),
+                    tx_hash: Some(format!("{:#x}", first_tx.hash)),
+                    tx_index: Some(0),
+                    input_index: None,
+                    output_index: None,
+                    referenced_out_point: None,
+                    expected_operator: Some("equal".to_string()),
+                    expected_value: Some("1".to_string()),
+                    actual_value: Some("0".to_string()),
+                    unit: Some("input".to_string()),
+                    reason: "cellbase must contain exactly one input".to_string(),
+                },
+            );
         }
 
         if first_tx.inner.witnesses.len() != 1 {
-            return CheckStatus::Fail;
+            status = CheckStatus::Fail;
+            log.push_detail(
+                &self.config,
+                DetailItem {
+                    check_name: "check_cellbase_structure".to_string(),
+                    status,
+                    error_code: "CELLBASE_WITNESS_COUNT_INVALID".to_string(),
+                    tx_hash: Some(format!("{:#x}", first_tx.hash)),
+                    tx_index: Some(0),
+                    input_index: None,
+                    output_index: None,
+                    referenced_out_point: None,
+                    expected_operator: Some("equal".to_string()),
+                    expected_value: Some("1".to_string()),
+                    actual_value: Some(first_tx.inner.witnesses.len().to_string()),
+                    unit: Some("witness".to_string()),
+                    reason: "cellbase must contain exactly one witness".to_string(),
+                },
+            );
         }
 
-        if packed::CellbaseWitness::from_slice(first_tx.inner.witnesses[0].as_bytes()).is_err() {
-            return CheckStatus::Fail;
+        if let Some(witness) = first_tx.inner.witnesses.first()
+            && packed::CellbaseWitness::from_slice(witness.as_bytes()).is_err()
+        {
+            status = CheckStatus::Fail;
+            log.push_detail(
+                &self.config,
+                DetailItem {
+                    check_name: "check_cellbase_structure".to_string(),
+                    status,
+                    error_code: "CELLBASE_WITNESS_INVALID".to_string(),
+                    tx_hash: Some(format!("{:#x}", first_tx.hash)),
+                    tx_index: Some(0),
+                    input_index: None,
+                    output_index: None,
+                    referenced_out_point: None,
+                    expected_operator: None,
+                    expected_value: None,
+                    actual_value: None,
+                    unit: None,
+                    reason: "cellbase witness cannot be decoded".to_string(),
+                },
+            );
         }
 
         if let Some(output) = first_tx.inner.outputs.first()
             && !output.type_.is_none()
         {
-            return CheckStatus::Fail;
+            status = CheckStatus::Fail;
+            log.push_detail(
+                &self.config,
+                DetailItem {
+                    check_name: "check_cellbase_structure".to_string(),
+                    status,
+                    error_code: "CELLBASE_TYPE_SCRIPT_PRESENT".to_string(),
+                    tx_hash: Some(format!("{:#x}", first_tx.hash)),
+                    tx_index: Some(0),
+                    input_index: None,
+                    output_index: Some(0),
+                    referenced_out_point: None,
+                    expected_operator: Some("equal".to_string()),
+                    expected_value: Some("none".to_string()),
+                    actual_value: Some("present".to_string()),
+                    unit: None,
+                    reason: "cellbase output type script must be absent".to_string(),
+                },
+            );
         }
         if first_tx
             .inner
@@ -1256,10 +1852,27 @@ impl<R: CkbRpc> Auditor<R> {
             .first()
             .is_some_and(|data| !data.as_bytes().is_empty())
         {
-            return CheckStatus::Fail;
+            status = CheckStatus::Fail;
+            log.push_detail(
+                &self.config,
+                DetailItem {
+                    check_name: "check_cellbase_structure".to_string(),
+                    status,
+                    error_code: "CELLBASE_OUTPUT_DATA_NOT_EMPTY".to_string(),
+                    tx_hash: Some(format!("{:#x}", first_tx.hash)),
+                    tx_index: Some(0),
+                    input_index: None,
+                    output_index: Some(0),
+                    referenced_out_point: None,
+                    expected_operator: Some("equal".to_string()),
+                    expected_value: Some("0".to_string()),
+                    actual_value: Some(first_tx.inner.outputs_data[0].as_bytes().len().to_string()),
+                    unit: Some("byte".to_string()),
+                    reason: "cellbase output data must be empty".to_string(),
+                },
+            );
         }
-
-        CheckStatus::Pass
+        log.check_cellbase_structure = status;
     }
 
     async fn fetch_committed_transaction(&self, hash: &H256) -> CachedTransaction {
@@ -1439,8 +2052,8 @@ impl<R: CkbRpc> Auditor<R> {
                 status: CheckStatus::Unknown,
                 error_code: "DAO_MAXIMUM_WITHDRAW_MISSING".to_string(),
                 reason: format!(
-                    "calculate_dao_maximum_withdraw returned null on network {} ({:#x})",
-                    consensus.network_id, consensus.genesis_hash
+                    "calculate_dao_maximum_withdraw returned null for consensus id '{}' (genesis {:#x})",
+                    consensus.consensus_id, consensus.genesis_hash
                 ),
             }),
             Err(err) => Err(ResolutionIssue {
@@ -1481,7 +2094,6 @@ impl<R: CkbRpc> Auditor<R> {
                 continue;
             }
 
-            log.capacity_eligible_tx_count += 1;
             overall_tx_version = merge_status(overall_tx_version, CheckStatus::Pass);
             overall_struct = merge_status(overall_struct, CheckStatus::Pass);
             overall_data_len = merge_status(overall_data_len, CheckStatus::Pass);
@@ -1497,6 +2109,25 @@ impl<R: CkbRpc> Auditor<R> {
             if let Some(consensus) = consensus {
                 if tx.inner.version.value() != consensus.tx_version {
                     overall_tx_version = merge_status(overall_tx_version, CheckStatus::Fail);
+                    log.push_detail(
+                        &self.config,
+                        DetailItem {
+                            check_name: "check_transaction_version".to_string(),
+                            status: CheckStatus::Fail,
+                            error_code: "TRANSACTION_VERSION_MISMATCH".to_string(),
+                            tx_hash: Some(format!("{:#x}", tx.hash)),
+                            tx_index: Some(tx_index),
+                            input_index: None,
+                            output_index: None,
+                            referenced_out_point: None,
+                            expected_operator: Some("equal".to_string()),
+                            expected_value: Some(consensus.tx_version.to_string()),
+                            actual_value: Some(tx.inner.version.value().to_string()),
+                            unit: Some("version".to_string()),
+                            reason: "transaction version does not match the consensus tx_version"
+                                .to_string(),
+                        },
+                    );
                 }
             } else {
                 overall_tx_version = merge_status(overall_tx_version, CheckStatus::Unknown);
@@ -1504,10 +2135,51 @@ impl<R: CkbRpc> Auditor<R> {
 
             if tx.inner.inputs.is_empty() || tx.inner.outputs.is_empty() {
                 overall_struct = merge_status(overall_struct, CheckStatus::Fail);
+                log.push_detail(
+                    &self.config,
+                    DetailItem {
+                        check_name: "check_inputs_outputs_structure".to_string(),
+                        status: CheckStatus::Fail,
+                        error_code: "TRANSACTION_IO_EMPTY".to_string(),
+                        tx_hash: Some(format!("{:#x}", tx.hash)),
+                        tx_index: Some(tx_index),
+                        input_index: None,
+                        output_index: None,
+                        referenced_out_point: None,
+                        expected_operator: Some("non_empty".to_string()),
+                        expected_value: Some("inputs>0 and outputs>0".to_string()),
+                        actual_value: Some(format!(
+                            "inputs={} outputs={}",
+                            tx.inner.inputs.len(),
+                            tx.inner.outputs.len()
+                        )),
+                        unit: None,
+                        reason: "non-cellbase transactions must contain at least one input and one output"
+                            .to_string(),
+                    },
+                );
             }
 
             if tx.inner.outputs.len() != tx.inner.outputs_data.len() {
                 overall_data_len = merge_status(overall_data_len, CheckStatus::Fail);
+                log.push_detail(
+                    &self.config,
+                    DetailItem {
+                        check_name: "check_outputs_data_length".to_string(),
+                        status: CheckStatus::Fail,
+                        error_code: "OUTPUTS_DATA_LENGTH_MISMATCH".to_string(),
+                        tx_hash: Some(format!("{:#x}", tx.hash)),
+                        tx_index: Some(tx_index),
+                        input_index: None,
+                        output_index: None,
+                        referenced_out_point: None,
+                        expected_operator: Some("equal".to_string()),
+                        expected_value: Some(tx.inner.outputs.len().to_string()),
+                        actual_value: Some(tx.inner.outputs_data.len().to_string()),
+                        unit: Some("output".to_string()),
+                        reason: "outputs_data length must equal outputs length".to_string(),
+                    },
+                );
             }
 
             let mut cell_dep_set = HashSet::new();
@@ -1521,6 +2193,24 @@ impl<R: CkbRpc> Auditor<R> {
                 !cell_dep_set.insert(key)
             }) {
                 overall_dup_cell_dep = merge_status(overall_dup_cell_dep, CheckStatus::Fail);
+                log.push_detail(
+                    &self.config,
+                    DetailItem {
+                        check_name: "check_duplicate_cell_deps".to_string(),
+                        status: CheckStatus::Fail,
+                        error_code: "DUPLICATE_CELL_DEP".to_string(),
+                        tx_hash: Some(format!("{:#x}", tx.hash)),
+                        tx_index: Some(tx_index),
+                        input_index: None,
+                        output_index: None,
+                        referenced_out_point: None,
+                        expected_operator: None,
+                        expected_value: None,
+                        actual_value: None,
+                        unit: None,
+                        reason: "duplicate cell_dep detected within transaction".to_string(),
+                    },
+                );
             }
 
             let mut header_dep_set = HashSet::new();
@@ -1531,6 +2221,24 @@ impl<R: CkbRpc> Auditor<R> {
                 .any(|h| !header_dep_set.insert(format!("{:#x}", h)))
             {
                 overall_dup_header_dep = merge_status(overall_dup_header_dep, CheckStatus::Fail);
+                log.push_detail(
+                    &self.config,
+                    DetailItem {
+                        check_name: "check_duplicate_header_deps".to_string(),
+                        status: CheckStatus::Fail,
+                        error_code: "DUPLICATE_HEADER_DEP".to_string(),
+                        tx_hash: Some(format!("{:#x}", tx.hash)),
+                        tx_index: Some(tx_index),
+                        input_index: None,
+                        output_index: None,
+                        referenced_out_point: None,
+                        expected_operator: None,
+                        expected_value: None,
+                        actual_value: None,
+                        unit: None,
+                        reason: "duplicate header_dep detected within transaction".to_string(),
+                    },
+                );
             }
 
             let mut input_set = HashSet::new();
@@ -1543,6 +2251,24 @@ impl<R: CkbRpc> Auditor<R> {
                 !input_set.insert(key)
             }) {
                 overall_dup_input_tx = merge_status(overall_dup_input_tx, CheckStatus::Fail);
+                log.push_detail(
+                    &self.config,
+                    DetailItem {
+                        check_name: "check_duplicate_inputs_in_transaction".to_string(),
+                        status: CheckStatus::Fail,
+                        error_code: "DUPLICATE_INPUT_IN_TRANSACTION".to_string(),
+                        tx_hash: Some(format!("{:#x}", tx.hash)),
+                        tx_index: Some(tx_index),
+                        input_index: None,
+                        output_index: None,
+                        referenced_out_point: None,
+                        expected_operator: None,
+                        expected_value: None,
+                        actual_value: None,
+                        unit: None,
+                        reason: "duplicate input out_point detected within transaction".to_string(),
+                    },
+                );
             }
 
             if tx.inner.inputs.iter().any(|input| {
@@ -1554,6 +2280,25 @@ impl<R: CkbRpc> Auditor<R> {
                 !block_inputs.insert(key)
             }) {
                 overall_dup_input_block = merge_status(overall_dup_input_block, CheckStatus::Fail);
+                log.push_detail(
+                    &self.config,
+                    DetailItem {
+                        check_name: "check_duplicate_inputs_in_block".to_string(),
+                        status: CheckStatus::Fail,
+                        error_code: "DUPLICATE_INPUT_IN_BLOCK".to_string(),
+                        tx_hash: Some(format!("{:#x}", tx.hash)),
+                        tx_index: Some(tx_index),
+                        input_index: None,
+                        output_index: None,
+                        referenced_out_point: None,
+                        expected_operator: None,
+                        expected_value: None,
+                        actual_value: None,
+                        unit: None,
+                        reason: "input out_point was already consumed by another transaction in this block"
+                            .to_string(),
+                    },
+                );
             }
 
             let mut ordinary_input_sum: u128 = 0;
@@ -1564,16 +2309,36 @@ impl<R: CkbRpc> Auditor<R> {
             let mut dao_effective_sum: u128 = 0;
 
             for (output_index, output) in tx.inner.outputs.iter().enumerate() {
-                ordinary_output_sum =
-                    match ordinary_output_sum.checked_add(output.capacity.value() as u128) {
-                        Some(v) => v,
-                        None => {
-                            overall_ordinary_capacity =
-                                merge_status(overall_ordinary_capacity, CheckStatus::Fail);
-                            tx_unknown = true;
-                            0
-                        }
-                    };
+                ordinary_output_sum = match ordinary_output_sum
+                    .checked_add(output.capacity.value() as u128)
+                {
+                    Some(v) => v,
+                    None => {
+                        overall_ordinary_capacity =
+                            merge_status(overall_ordinary_capacity, CheckStatus::Fail);
+                        tx_unknown = true;
+                        log.push_detail(
+                                &self.config,
+                                DetailItem {
+                                    check_name: "check_ordinary_capacity_conservation".to_string(),
+                                    status: CheckStatus::Fail,
+                                    error_code: "OUTPUT_CAPACITY_SUM_OVERFLOW".to_string(),
+                                    tx_hash: Some(format!("{:#x}", tx.hash)),
+                                    tx_index: Some(tx_index),
+                                    input_index: None,
+                                    output_index: Some(output_index),
+                                    referenced_out_point: None,
+                                    expected_operator: None,
+                                    expected_value: None,
+                                    actual_value: None,
+                                    unit: Some("shannon".to_string()),
+                                    reason: "summed output capacity overflowed u128 during ordinary capacity validation"
+                                        .to_string(),
+                                },
+                            );
+                        0
+                    }
+                };
                 let data_capacity = tx
                     .inner
                     .outputs_data
@@ -1586,6 +2351,26 @@ impl<R: CkbRpc> Auditor<R> {
                 {
                     overall_occupied_capacity =
                         merge_status(overall_occupied_capacity, CheckStatus::Fail);
+                    log.push_detail(
+                        &self.config,
+                        DetailItem {
+                            check_name: "check_occupied_capacity".to_string(),
+                            status: CheckStatus::Fail,
+                            error_code: "OUTPUT_BELOW_OCCUPIED_CAPACITY".to_string(),
+                            tx_hash: Some(format!("{:#x}", tx.hash)),
+                            tx_index: Some(tx_index),
+                            input_index: None,
+                            output_index: Some(output_index),
+                            referenced_out_point: None,
+                            expected_operator: Some("greater_than_or_equal".to_string()),
+                            expected_value: Some(data_capacity.as_u64().to_string()),
+                            actual_value: Some(output.capacity.value().to_string()),
+                            unit: Some("shannon".to_string()),
+                            reason:
+                                "output capacity is below occupied capacity for its data payload"
+                                    .to_string(),
+                        },
+                    );
                 }
             }
 
@@ -1613,11 +2398,22 @@ impl<R: CkbRpc> Auditor<R> {
                     CachedTransaction::Unavailable(issue) => {
                         tx_unknown = true;
                         classification_unknown = true;
-                        log.unresolved_input_count += 1;
                         overall_input_resolution =
                             merge_status(overall_input_resolution, issue.status);
                         overall_input_index =
                             merge_status(overall_input_index, CheckStatus::Unknown);
+                        self.push_input_detail(
+                            log,
+                            "check_input_output_index",
+                            CheckStatus::Unknown,
+                            "INPUT_INDEX_UNVERIFIED",
+                            &tx.hash,
+                            tx_index,
+                            input_index,
+                            out_point.clone(),
+                            "input output index could not be verified because the source transaction was unavailable"
+                                .to_string(),
+                        );
                         self.push_input_detail(
                             log,
                             "check_input_content_resolution",
@@ -1671,12 +2467,10 @@ impl<R: CkbRpc> Auditor<R> {
                     {
                         Ok(capacity) => {
                             dao_effective_sum = dao_effective_sum.saturating_add(capacity);
-                            log.dao_checked_inputs_count += 1;
                         }
                         Err(issue) => {
                             tx_unknown = true;
                             classification_unknown = true;
-                            log.dao_unresolved_inputs_count += 1;
                             self.push_input_detail(
                                 log,
                                 "check_dao_withdraw_capacity",
@@ -1696,6 +2490,17 @@ impl<R: CkbRpc> Auditor<R> {
                 } else if resolved.block_hash == H256::default() {
                     tx_unknown = true;
                     classification_unknown = true;
+                    self.push_input_detail(
+                        log,
+                        "check_input_content_resolution",
+                        CheckStatus::Unknown,
+                        "INPUT_SOURCE_BLOCK_HASH_ZERO",
+                        &tx.hash,
+                        tx_index,
+                        input_index,
+                        out_point,
+                        "committed source transaction returned an all-zero block hash".to_string(),
+                    );
                 } else {
                     ordinary_input_sum =
                         ordinary_input_sum.saturating_add(resolved_output.capacity.value() as u128);
@@ -1703,11 +2508,18 @@ impl<R: CkbRpc> Auditor<R> {
             }
 
             if has_dao_input {
-                log.dao_related_tx_count += 1;
                 let expected = ordinary_input_sum.saturating_add(dao_effective_sum);
                 if tx_unknown {
                     overall_dao_capacity = merge_status(overall_dao_capacity, CheckStatus::Unknown);
-                    log.capacity_unchecked_tx_count += 1;
+                    self.push_unknown_detail(
+                        log,
+                        "check_dao_withdraw_capacity",
+                        "DAO_WITHDRAW_CAPACITY_INCOMPLETE",
+                        format!(
+                            "dao-related transaction {:#x} has unresolved inputs or prerequisite data",
+                            tx.hash
+                        ),
+                    );
                 } else if ordinary_output_sum > expected {
                     overall_dao_capacity = merge_status(overall_dao_capacity, CheckStatus::Fail);
                     log.push_detail(
@@ -1729,29 +2541,49 @@ impl<R: CkbRpc> Auditor<R> {
                                 .to_string(),
                         },
                     );
-                    log.capacity_checked_tx_count += 1;
-                    log.capacity_failed_tx_count += 1;
                 } else {
                     overall_dao_capacity = merge_status(overall_dao_capacity, CheckStatus::Pass);
-                    log.capacity_checked_tx_count += 1;
                 }
             } else if classification_unknown {
                 overall_ordinary_capacity =
                     merge_status(overall_ordinary_capacity, CheckStatus::Unknown);
                 overall_dao_capacity = merge_status(overall_dao_capacity, CheckStatus::Unknown);
-                log.capacity_unchecked_tx_count += 1;
+                self.push_unknown_detail(
+                    log,
+                    "check_ordinary_capacity_conservation",
+                    "ORDINARY_CAPACITY_CLASSIFICATION_UNKNOWN",
+                    format!(
+                        "transaction {:#x} has unresolved inputs or unknown consensus classification, so ordinary capacity cannot be validated",
+                        tx.hash
+                    ),
+                );
+                self.push_unknown_detail(
+                    log,
+                    "check_dao_withdraw_capacity",
+                    "DAO_CLASSIFICATION_UNKNOWN",
+                    format!(
+                        "transaction {:#x} could not be conclusively classified as ordinary-only or dao-related",
+                        tx.hash
+                    ),
+                );
             } else {
                 overall_ordinary_capacity =
                     merge_status(overall_ordinary_capacity, CheckStatus::Pass);
                 if tx_unknown {
                     overall_ordinary_capacity =
                         merge_status(overall_ordinary_capacity, CheckStatus::Unknown);
-                    log.capacity_unchecked_tx_count += 1;
+                    self.push_unknown_detail(
+                        log,
+                        "check_ordinary_capacity_conservation",
+                        "ORDINARY_CAPACITY_INCOMPLETE",
+                        format!(
+                            "ordinary capacity validation for transaction {:#x} was incomplete",
+                            tx.hash
+                        ),
+                    );
                 } else if ordinary_output_sum > ordinary_input_sum {
                     overall_ordinary_capacity =
                         merge_status(overall_ordinary_capacity, CheckStatus::Fail);
-                    log.capacity_failed_tx_count += 1;
-                    log.capacity_checked_tx_count += 1;
                     log.push_detail(
                         &self.config,
                         DetailItem {
@@ -1770,8 +2602,6 @@ impl<R: CkbRpc> Auditor<R> {
                             reason: "ordinary outputs must be <= ordinary inputs".to_string(),
                         },
                     );
-                } else {
-                    log.capacity_checked_tx_count += 1;
                 }
             }
         }
@@ -1801,17 +2631,52 @@ impl<R: CkbRpc> Auditor<R> {
         let Some(cellbase) = block.transactions.first() else {
             log.check_cellbase_reward_amount = CheckStatus::Fail;
             log.check_cellbase_reward_target = CheckStatus::Unknown;
+            log.push_detail(
+                &self.config,
+                DetailItem {
+                    check_name: "check_cellbase_reward_amount".to_string(),
+                    status: CheckStatus::Fail,
+                    error_code: "CELLBASE_MISSING".to_string(),
+                    tx_hash: None,
+                    tx_index: None,
+                    input_index: None,
+                    output_index: None,
+                    referenced_out_point: None,
+                    expected_operator: None,
+                    expected_value: None,
+                    actual_value: None,
+                    unit: None,
+                    reason: "block is missing a cellbase transaction".to_string(),
+                },
+            );
+            self.push_unknown_detail(
+                log,
+                "check_cellbase_reward_target",
+                "CELLBASE_MISSING",
+                "reward target cannot be verified without a cellbase transaction".to_string(),
+            );
             return;
         };
 
         let actual = cellbase.inner.outputs.iter().fold(0u128, |acc, o| {
             acc.saturating_add(o.capacity.value() as u128)
         });
-        log.reward_actual_amount = Some(actual.to_string());
 
         let Some(consensus) = consensus else {
             log.check_cellbase_reward_amount = CheckStatus::Unknown;
             log.check_cellbase_reward_target = CheckStatus::Unknown;
+            self.push_unknown_detail(
+                log,
+                "check_cellbase_reward_amount",
+                "CONSENSUS_UNAVAILABLE",
+                "reward validation requires get_consensus parameters".to_string(),
+            );
+            self.push_unknown_detail(
+                log,
+                "check_cellbase_reward_target",
+                "CONSENSUS_UNAVAILABLE",
+                "reward target validation requires get_consensus parameters".to_string(),
+            );
             return;
         };
 
@@ -1875,7 +2740,6 @@ impl<R: CkbRpc> Auditor<R> {
             }
         };
         let target_hash = target_header.hash;
-        log.reward_target_block_hash = Some(format!("{target_hash:#x}"));
 
         match self.rpc.get_block_economic_state(&target_hash).await {
             Ok(Some(economic)) => {
@@ -1883,7 +2747,6 @@ impl<R: CkbRpc> Auditor<R> {
                     + economic.miner_reward.secondary.value() as u128
                     + economic.miner_reward.committed.value() as u128
                     + economic.miner_reward.proposal.value() as u128;
-                log.reward_expected_amount = Some(expected.to_string());
 
                 if economic.finalized_at != block.header.hash {
                     log.check_cellbase_reward_amount = CheckStatus::Unknown;
@@ -1894,6 +2757,15 @@ impl<R: CkbRpc> Auditor<R> {
                         "REWARD_FINALIZATION_MISMATCH",
                         format!(
                             "economic state finalized_at {:#x} does not match audited block hash {:#x}",
+                            economic.finalized_at, block.header.hash
+                        ),
+                    );
+                    self.push_unknown_detail(
+                        log,
+                        "check_cellbase_reward_target",
+                        "REWARD_FINALIZATION_MISMATCH",
+                        format!(
+                            "cannot validate reward target because economic state finalized_at {:#x} does not match audited block hash {:#x}",
                             economic.finalized_at, block.header.hash
                         ),
                     );
@@ -1909,6 +2781,12 @@ impl<R: CkbRpc> Auditor<R> {
                         log.check_cellbase_reward_target = CheckStatus::Unknown;
                         self.push_unknown_detail(
                             log,
+                            "check_cellbase_reward_amount",
+                            "REWARD_TARGET_BLOCK_MISMATCH",
+                            "reward amount cannot be validated because the target block fetched by hash did not match the requested hash".to_string(),
+                        );
+                        self.push_unknown_detail(
+                            log,
                             "check_cellbase_reward_target",
                             "REWARD_TARGET_BLOCK_MISMATCH",
                             "target block fetched by hash did not match requested hash".to_string(),
@@ -1918,6 +2796,12 @@ impl<R: CkbRpc> Auditor<R> {
                     Ok(None) => {
                         log.check_cellbase_reward_amount = CheckStatus::Unknown;
                         log.check_cellbase_reward_target = CheckStatus::Unknown;
+                        self.push_unknown_detail(
+                            log,
+                            "check_cellbase_reward_amount",
+                            "REWARD_TARGET_BLOCK_MISSING",
+                            format!("reward amount cannot be validated because target block {} is unavailable by hash", target_number),
+                        );
                         self.push_unknown_detail(
                             log,
                             "check_cellbase_reward_target",
@@ -1931,6 +2815,12 @@ impl<R: CkbRpc> Auditor<R> {
                         log.check_cellbase_reward_target = CheckStatus::Unknown;
                         self.push_unknown_detail(
                             log,
+                            "check_cellbase_reward_amount",
+                            "REWARD_TARGET_BLOCK_RPC_ERROR",
+                            format!("reward amount cannot be validated because target block lookup failed: {err}"),
+                        );
+                        self.push_unknown_detail(
+                            log,
                             "check_cellbase_reward_target",
                             "REWARD_TARGET_BLOCK_RPC_ERROR",
                             format!("target block lookup failed: {err}"),
@@ -1941,6 +2831,12 @@ impl<R: CkbRpc> Auditor<R> {
                 let Some(target_cellbase) = target_block.transactions.first() else {
                     log.check_cellbase_reward_amount = CheckStatus::Unknown;
                     log.check_cellbase_reward_target = CheckStatus::Unknown;
+                    self.push_unknown_detail(
+                        log,
+                        "check_cellbase_reward_amount",
+                        "REWARD_TARGET_CELLBASE_MISSING",
+                        "reward amount cannot be validated because the target block is missing cellbase transaction".to_string(),
+                    );
                     self.push_unknown_detail(
                         log,
                         "check_cellbase_reward_target",
@@ -1956,6 +2852,12 @@ impl<R: CkbRpc> Auditor<R> {
                 }) else {
                     log.check_cellbase_reward_amount = CheckStatus::Unknown;
                     log.check_cellbase_reward_target = CheckStatus::Unknown;
+                    self.push_unknown_detail(
+                        log,
+                        "check_cellbase_reward_amount",
+                        "REWARD_TARGET_WITNESS_INVALID",
+                        "reward amount cannot be validated because the target cellbase witness cannot be decoded".to_string(),
+                    );
                     self.push_unknown_detail(
                         log,
                         "check_cellbase_reward_target",
@@ -1993,7 +2895,7 @@ impl<R: CkbRpc> Auditor<R> {
                                 output_index: None,
                                 referenced_out_point: None,
                                 expected_operator: Some("equal".to_string()),
-                                expected_value: Some("0".to_string()),
+                                expected_value: Some(format!("0 (target_block={target_number} target_hash={target_hash:#x})")),
                                 actual_value: Some(actual.to_string()),
                                 unit: Some("shannon".to_string()),
                                 reason: "finalized reward is below the occupied capacity of the correct target lock, so cellbase outputs must be empty".to_string(),
@@ -2019,7 +2921,7 @@ impl<R: CkbRpc> Auditor<R> {
                             output_index: None,
                             referenced_out_point: None,
                             expected_operator: Some("equal".to_string()),
-                            expected_value: Some(expected.to_string()),
+                            expected_value: Some(format!("{expected} (target_block={target_number} target_hash={target_hash:#x})")),
                             actual_value: Some(actual.to_string()),
                             unit: Some("shannon".to_string()),
                             reason: "cellbase output total does not match finalized target block economic state"
@@ -2077,7 +2979,7 @@ impl<R: CkbRpc> Auditor<R> {
                                 output_index: Some(0),
                                 referenced_out_point: None,
                                 expected_operator: Some("equal".to_string()),
-                                expected_value: Some(expected.to_string()),
+                                expected_value: Some(format!("{expected} (target_block={target_number} target_hash={target_hash:#x})")),
                                 actual_value: Some(paid_to_expected_lock.to_string()),
                                 unit: Some("shannon".to_string()),
                                 reason: format!(
@@ -2113,6 +3015,15 @@ impl<R: CkbRpc> Auditor<R> {
                         ),
                     },
                 );
+                self.push_unknown_detail(
+                    log,
+                    "check_cellbase_reward_target",
+                    "ECONOMIC_STATE_MISSING",
+                    format!(
+                        "reward target cannot be fully validated because get_block_economic_state returned null for reward target block {} ({target_hash:#x})",
+                        target_number
+                    ),
+                );
             }
             Err(err) => {
                 log.check_cellbase_reward_amount = CheckStatus::Unknown;
@@ -2137,6 +3048,15 @@ impl<R: CkbRpc> Auditor<R> {
                             target_number
                         ),
                     },
+                );
+                self.push_unknown_detail(
+                    log,
+                    "check_cellbase_reward_target",
+                    "ECONOMIC_STATE_RPC_ERROR",
+                    format!(
+                        "reward target cannot be fully validated because get_block_economic_state failed for reward target block {} ({target_hash:#x}): {err}",
+                        target_number
+                    ),
                 );
             }
         }
@@ -2311,6 +3231,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cursor.json");
         let c = CursorState {
+            genesis_hash: Some(format!("{:#x}", H256::from([1u8; 32]))),
             last_height: 1,
             last_hash: "0x1".to_string(),
             history: BTreeMap::from([(1, "0x1".to_string())]),
@@ -2324,12 +3245,11 @@ mod tests {
     fn test_config(cursor_path: PathBuf) -> AuditorConfig {
         AuditorConfig {
             rpc_url: "http://127.0.0.1:8114".to_string(),
-            network: "testnet".to_string(),
             node_id: "node-1".to_string(),
             poll_interval_ms: 1000,
             rpc_timeout_secs: 10,
             max_retries: 0,
-            cursor_path,
+            cursor_path: Some(cursor_path),
             log_path: None,
             max_details: 100,
             max_future_ms: 15_000,
@@ -2342,13 +3262,21 @@ mod tests {
     }
 
     fn mock_consensus() -> RpcConsensus {
-        mock_consensus_with_limit(0x1000)
+        mock_consensus_with_id_and_limit("testnet", H256::from([1u8; 32]), 0x1000)
     }
 
     fn mock_consensus_with_limit(max_block_bytes: u64) -> RpcConsensus {
+        mock_consensus_with_id_and_limit("testnet", H256::from([1u8; 32]), max_block_bytes)
+    }
+
+    fn mock_consensus_with_id_and_limit(
+        id: &str,
+        genesis_hash: H256,
+        max_block_bytes: u64,
+    ) -> RpcConsensus {
         serde_json::from_value(json!({
-            "id": "testnet",
-            "genesis_hash": format!("{:#x}", H256::from([1u8; 32])),
+            "id": id,
+            "genesis_hash": format!("{genesis_hash:#x}"),
             "dao_type_hash": format!("{:#x}", H256::from([2u8; 32])),
             "secp256k1_blake160_sighash_all_type_hash": null,
             "secp256k1_blake160_multisig_all_type_hash": null,
@@ -2464,8 +3392,16 @@ mod tests {
         (format!("http://127.0.0.1:{}", addr.port()), body, handle)
     }
 
+    fn read_log_lines(path: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
     #[tokio::test]
-    async fn test_first_startup_anchor_tip_only() {
+    async fn test_first_startup_audits_tip_and_persists_cursor() {
         let dir = tempfile::tempdir().unwrap();
         let cursor_path = dir.path().join("cursor.json");
         let cfg = test_config(cursor_path.clone());
@@ -2475,11 +3411,17 @@ mod tests {
             .timestamp(1000u64)
             .epoch(EpochNumberWithFraction::new(0, 100, 1000).full_value())
             .build();
+        let tip_block = BlockBuilder::default().header(tip_header.clone()).build();
         let tip_json: HeaderView = tip_header.into();
+        let tip_block_json: BlockView = tip_block.clone().into();
 
         let rpc = Arc::new(MockRpc::default());
         *rpc.tip.lock().unwrap() = Some(tip_json);
         *rpc.consensus.lock().unwrap() = Some(mock_consensus());
+        rpc.blocks_by_number
+            .lock()
+            .unwrap()
+            .insert(100, tip_block_json);
 
         let auditor = Auditor::new(rpc, cfg);
         let mut cursor = None;
@@ -2487,6 +3429,267 @@ mod tests {
 
         let loaded = CursorState::load(&cursor_path).await.unwrap().unwrap();
         assert_eq!(loaded.last_height, 100);
+        assert_eq!(
+            loaded.genesis_hash,
+            Some(format!("{:#x}", H256::from([1u8; 32])))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_cursor_mode_audits_tip_tracks_intermediate_blocks_and_does_not_create_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("audit.log");
+        let mut cfg = test_config(dir.path().join("cursor.json"));
+        cfg.cursor_path = None;
+        cfg.log_path = Some(log_path.clone());
+
+        let header_100 = HeaderBuilder::default()
+            .number(100u64)
+            .timestamp(1000u64)
+            .epoch(EpochNumberWithFraction::new(0, 100, 1000).full_value())
+            .build();
+        let header_101 = HeaderBuilder::default()
+            .number(101u64)
+            .timestamp(1010u64)
+            .epoch(EpochNumberWithFraction::new(0, 101, 1000).full_value())
+            .parent_hash(header_100.hash())
+            .build();
+        let header_102 = HeaderBuilder::default()
+            .number(102u64)
+            .timestamp(1020u64)
+            .epoch(EpochNumberWithFraction::new(0, 102, 1000).full_value())
+            .parent_hash(header_101.hash())
+            .build();
+        let header_105 = HeaderBuilder::default()
+            .number(105u64)
+            .timestamp(1050u64)
+            .epoch(EpochNumberWithFraction::new(0, 105, 1000).full_value())
+            .build();
+
+        let block_100: BlockView = BlockBuilder::default()
+            .header(header_100.clone())
+            .build()
+            .into();
+        let block_101: BlockView = BlockBuilder::default()
+            .header(header_101.clone())
+            .build()
+            .into();
+        let block_102: BlockView = BlockBuilder::default()
+            .header(header_102.clone())
+            .build()
+            .into();
+        let block_105: BlockView = BlockBuilder::default()
+            .header(header_105.clone())
+            .build()
+            .into();
+
+        let rpc = Arc::new(MockRpc::default());
+        *rpc.consensus.lock().unwrap() = Some(mock_consensus());
+        *rpc.tip.lock().unwrap() = Some(block_100.header.clone());
+        rpc.blocks_by_number
+            .lock()
+            .unwrap()
+            .insert(100, block_100.clone());
+        rpc.headers_by_number
+            .lock()
+            .unwrap()
+            .insert(100, block_100.header.clone());
+        rpc.headers_by_hash.lock().unwrap().insert(
+            format!("{:#x}", block_100.header.hash),
+            block_100.header.clone(),
+        );
+
+        let auditor = Auditor::new(rpc.clone(), cfg.clone());
+        let mut cursor = None;
+        auditor.poll_once(&mut cursor).await.unwrap();
+        assert_eq!(read_log_lines(&log_path).len(), 1);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "only the explicit log file should be created"
+        );
+
+        *rpc.tip.lock().unwrap() = Some(block_102.header.clone());
+        rpc.blocks_by_number
+            .lock()
+            .unwrap()
+            .insert(101, block_101.clone());
+        rpc.blocks_by_number
+            .lock()
+            .unwrap()
+            .insert(102, block_102.clone());
+        rpc.headers_by_number
+            .lock()
+            .unwrap()
+            .insert(101, block_101.header.clone());
+        rpc.headers_by_number
+            .lock()
+            .unwrap()
+            .insert(102, block_102.header.clone());
+        rpc.headers_by_hash.lock().unwrap().insert(
+            format!("{:#x}", block_101.header.hash),
+            block_101.header.clone(),
+        );
+        rpc.headers_by_hash.lock().unwrap().insert(
+            format!("{:#x}", block_102.header.hash),
+            block_102.header.clone(),
+        );
+
+        auditor.poll_once(&mut cursor).await.unwrap();
+        auditor.poll_once(&mut cursor).await.unwrap();
+        let lines = read_log_lines(&log_path);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0]["block_height"], 100);
+        assert_eq!(lines[1]["block_height"], 101);
+        assert_eq!(lines[2]["block_height"], 102);
+
+        *rpc.tip.lock().unwrap() = Some(block_105.header.clone());
+        rpc.blocks_by_number
+            .lock()
+            .unwrap()
+            .insert(105, block_105.clone());
+        rpc.headers_by_number
+            .lock()
+            .unwrap()
+            .insert(105, block_105.header.clone());
+        let restarted = Auditor::new(rpc, cfg);
+        let mut restart_cursor = None;
+        restarted.poll_once(&mut restart_cursor).await.unwrap();
+        let lines = read_log_lines(&log_path);
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[3]["block_height"], 105);
+    }
+
+    #[tokio::test]
+    async fn test_missing_consensus_does_not_create_or_advance_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let cursor_path = dir.path().join("cursor.json");
+        let cfg = test_config(cursor_path.clone());
+        let tip_header = HeaderBuilder::default()
+            .number(7u64)
+            .epoch(EpochNumberWithFraction::new(0, 7, 1000).full_value())
+            .build();
+        let tip_block: BlockView = BlockBuilder::default()
+            .header(tip_header.clone())
+            .build()
+            .into();
+
+        let rpc = Arc::new(MockRpc::default());
+        *rpc.tip.lock().unwrap() = Some(tip_header.into());
+        rpc.blocks_by_number.lock().unwrap().insert(7, tip_block);
+
+        let auditor = Auditor::new(rpc, cfg);
+        let mut cursor = None;
+        let err = auditor
+            .poll_once(&mut cursor)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("consensus prerequisite failed"));
+        assert!(cursor.is_none());
+        assert!(!cursor_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_cursor_genesis_mismatch_is_rejected_without_overwriting_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cursor_path = dir.path().join("cursor.json");
+        let existing = CursorState {
+            genesis_hash: Some(format!("{:#x}", H256::from([1u8; 32]))),
+            last_height: 9,
+            last_hash: format!("{:#x}", H256::from([9u8; 32])),
+            history: BTreeMap::from([(9, format!("{:#x}", H256::from([9u8; 32])))]),
+        };
+        existing.save(&cursor_path).await.unwrap();
+        let original = std::fs::read_to_string(&cursor_path).unwrap();
+
+        let cfg = test_config(cursor_path.clone());
+        let tip_header = HeaderBuilder::default()
+            .number(10u64)
+            .epoch(EpochNumberWithFraction::new(0, 10, 1000).full_value())
+            .build();
+        let rpc = Arc::new(MockRpc::default());
+        *rpc.tip.lock().unwrap() = Some(tip_header.into());
+        *rpc.consensus.lock().unwrap() = Some(mock_consensus_with_id_and_limit(
+            "ckb",
+            H256::from([3u8; 32]),
+            0x1000,
+        ));
+
+        let auditor = Auditor::new(rpc, cfg);
+        let mut cursor = auditor.load_cursor().await.unwrap();
+        let err = auditor
+            .poll_once(&mut cursor)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cursor genesis hash"));
+        assert_eq!(std::fs::read_to_string(&cursor_path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn test_legacy_cursor_migrates_only_after_matching_history_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let cursor_path = dir.path().join("cursor.json");
+        let header_100 = HeaderBuilder::default()
+            .number(100u64)
+            .epoch(EpochNumberWithFraction::new(0, 100, 1000).full_value())
+            .build();
+        let header_101 = HeaderBuilder::default()
+            .number(101u64)
+            .epoch(EpochNumberWithFraction::new(0, 101, 1000).full_value())
+            .parent_hash(header_100.hash())
+            .build();
+        let block_101: BlockView = BlockBuilder::default()
+            .header(header_101.clone())
+            .build()
+            .into();
+        std::fs::write(
+            &cursor_path,
+            serde_json::to_vec_pretty(&json!({
+                "last_height": 100,
+                "last_hash": format!("{:#x}", header_100.hash()),
+                "history": {
+                    "100": format!("{:#x}", header_100.hash())
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let cfg = test_config(cursor_path.clone());
+
+        let rpc = Arc::new(MockRpc::default());
+        *rpc.consensus.lock().unwrap() = Some(mock_consensus_with_id_and_limit(
+            "compatible-devnet",
+            H256::from([1u8; 32]),
+            0x1000,
+        ));
+        *rpc.tip.lock().unwrap() = Some(header_101.clone().into());
+        rpc.headers_by_number
+            .lock()
+            .unwrap()
+            .insert(100, header_100.clone().into());
+        rpc.headers_by_number
+            .lock()
+            .unwrap()
+            .insert(101, header_101.clone().into());
+        rpc.headers_by_hash.lock().unwrap().insert(
+            format!("{:#x}", header_100.hash()),
+            header_100.clone().into(),
+        );
+        rpc.blocks_by_number.lock().unwrap().insert(101, block_101);
+
+        let auditor = Auditor::new(rpc, cfg);
+        let mut cursor = auditor.load_cursor().await.unwrap();
+        auditor.poll_once(&mut cursor).await.unwrap();
+
+        let migrated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cursor_path).unwrap()).unwrap();
+        assert_eq!(
+            migrated["genesis_hash"],
+            serde_json::Value::String(format!("{:#x}", H256::from([1u8; 32])))
+        );
     }
 
     #[tokio::test]
@@ -2591,7 +3794,11 @@ mod tests {
         let log = auditor.audit_block(&block_json).await;
         assert_eq!(log.check_ordinary_capacity_conservation, CheckStatus::Fail);
         assert_eq!(log.result, AuditResult::Fail);
-        assert!(!log.failed_checks.is_empty());
+        assert!(
+            log.failed_checks
+                .as_ref()
+                .is_some_and(|checks| !checks.is_empty())
+        );
     }
 
     #[tokio::test]
@@ -2752,10 +3959,7 @@ mod tests {
         eprintln!("{:?}", serde_json::to_value(&log).unwrap());
         assert_eq!(log.check_cellbase_reward_amount, CheckStatus::Pass);
         assert_eq!(log.check_cellbase_reward_target, CheckStatus::Pass);
-        assert_eq!(
-            log.reward_target_block_hash,
-            Some(format!("{:#x}", canonical_target_header.hash()))
-        );
+        assert!(log.details.is_none());
     }
 
     #[tokio::test]
@@ -2819,6 +4023,8 @@ mod tests {
         assert!(serialized.get("check_dao_withdraw_capacity").is_some());
         assert!(
             log.details
+                .as_ref()
+                .unwrap()
                 .iter()
                 .any(|detail| detail.referenced_out_point.as_deref().is_some())
         );
@@ -2836,12 +4042,76 @@ mod tests {
         log.finalize();
 
         let value = serde_json::to_value(&log).unwrap();
-        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["schema_version"], 3);
         assert!(value.get("check_block_height").is_some());
         assert!(value.get("check_cellbase_reward_amount").is_some());
         assert!(value.get("check_pow").is_none());
         assert!(value.get("check_dao_withdraw_capacity").is_none());
+        assert!(value.get("network").is_none());
         assert!(value.get("reward_target_block_hash").is_none());
+        assert!(value.get("reward_verification_method").is_none());
+        assert!(value.get("failed_checks").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_failure_serialization_keeps_all_failed_checks_summary_when_details_truncate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().join("cursor.json"));
+        cfg.max_details = 1;
+
+        let proposal_tx = TransactionBuilder::default()
+            .output(simple_cell_output(42))
+            .output_data(ckb_types::bytes::Bytes::new())
+            .build();
+        let block = BlockBuilder::default()
+            .header(HeaderBuilder::default().number(0u64).build())
+            .proposal(proposal_tx.proposal_short_id())
+            .build();
+        let mut block_json: BlockView = block.clone().into();
+        block_json.header.hash = H256::from([9u8; 32]);
+        block_json.header.inner.transactions_root = H256::from([8u8; 32]);
+        block_json.header.inner.proposals_hash = H256::from([7u8; 32]);
+        block_json.header.inner.extra_hash = H256::from([6u8; 32]);
+        let core_block: CoreBlockView = block.clone();
+
+        let rpc = Arc::new(MockRpc::default());
+        let auditor = Auditor::new(rpc, cfg.clone());
+        let mut fail_consensus_value = serde_json::to_value(mock_consensus_with_id_and_limit(
+            "ckb",
+            H256::from([1u8; 32]),
+            1,
+        ))
+        .unwrap();
+        fail_consensus_value["max_block_proposals_limit"] = json!("0x0");
+        let fail_consensus = ConsensusSnapshot::from_rpc(
+            &cfg,
+            serde_json::from_value(fail_consensus_value).unwrap(),
+        )
+        .unwrap();
+        let mut log = AuditLog::new(&cfg, &block_json);
+        auditor
+            .audit_header_and_block(&block_json, &core_block, &mut log, Some(&fail_consensus))
+            .await;
+        auditor.backfill_anomaly_details(&mut log);
+        log.finalize();
+
+        let failed_checks = log.failed_checks.as_ref().unwrap();
+        assert!(failed_checks.contains(&"check_block_size".to_string()));
+        assert!(failed_checks.contains(&"check_proposal_limit".to_string()));
+        assert!(failed_checks.contains(&"check_block_hash".to_string()));
+        assert!(failed_checks.contains(&"check_transactions_root".to_string()));
+        assert!(failed_checks.contains(&"check_proposals_hash".to_string()));
+        assert!(failed_checks.contains(&"check_extra_hash".to_string()));
+        assert!(log.details_total.unwrap() >= failed_checks.len());
+        assert_eq!(log.details_truncated, Some(true));
+        assert_eq!(log.details.as_ref().unwrap().len(), 1);
+
+        let value = serde_json::to_value(&log).unwrap();
+        assert!(value.get("network").is_none());
+        assert!(value.get("reward_verification_method").is_none());
+        assert!(value.get("block_consensus_size_bytes").is_none());
+        assert!(value["details_total"].as_u64().unwrap() >= failed_checks.len() as u64);
+        assert_eq!(value["details_truncated"], true);
     }
 
     #[tokio::test]
