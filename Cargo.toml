@@ -1,0 +1,22 @@
+[package]
+name = "ckb-block-auditor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+async-trait = "0.1.89"
+chrono = { version = "0.4.42", features = ["serde"] }
+ckb-hash = "1.1.1"
+ckb-jsonrpc-types = "1.2.0"
+ckb-occupied-capacity = "1.1.1"
+ckb-types = "1.1.3"
+clap = { version = "4.5.47", features = ["derive", "env"] }
+hex = "0.4.3"
+reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "signal", "time", "fs"] }
+
+[dev-dependencies]
+tempfile = "3.22.0"
