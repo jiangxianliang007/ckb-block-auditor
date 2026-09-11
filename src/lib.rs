@@ -9,8 +9,9 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
 use ckb_jsonrpc_types::{
-    BlockEconomicState, BlockView, Either, HeaderView, OutPoint, ResponseFormat, ScriptHashType,
-    TransactionView, TransactionWithStatusResponse, Uint64,
+    BlockEconomicState, BlockView, Consensus as RpcConsensus, DaoWithdrawingCalculationKind,
+    Either, HeaderView, OutPoint, ResponseFormat, ScriptHashType, Status, TransactionView,
+    TransactionWithStatusResponse, Uint64,
 };
 use ckb_occupied_capacity::Capacity as OccupiedCapacity;
 use ckb_types::H256;
@@ -93,6 +94,12 @@ pub enum CheckStatus {
     NotImplemented,
 }
 
+impl CheckStatus {
+    fn is_omitted(&self) -> bool {
+        matches!(self, Self::NotApplicable | Self::NotImplemented)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AuditResult {
@@ -110,11 +117,81 @@ pub struct DetailItem {
     pub tx_index: Option<usize>,
     pub input_index: Option<usize>,
     pub output_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub referenced_out_point: Option<String>,
     pub expected_operator: Option<String>,
     pub expected_value: Option<String>,
     pub actual_value: Option<String>,
     pub unit: Option<String>,
     pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+struct ConsensusSnapshot {
+    network_id: String,
+    genesis_hash: H256,
+    dao_type_hash: H256,
+    max_block_bytes: usize,
+    proposal_limit: usize,
+    tx_version: u32,
+    median_time_block_count: usize,
+    finalization_delay_length: u64,
+}
+
+impl ConsensusSnapshot {
+    fn from_rpc(config: &AuditorConfig, consensus: RpcConsensus) -> Result<Self> {
+        let network_id = consensus.id.clone();
+        if !network_id.eq_ignore_ascii_case(&config.network) {
+            return Err(anyhow!(
+                "configured network '{}' does not match node consensus id '{}'",
+                config.network,
+                network_id
+            ));
+        }
+        if !config.dao_type_hash.is_empty()
+            && !format!("{:#x}", consensus.dao_type_hash)
+                .eq_ignore_ascii_case(&config.dao_type_hash)
+        {
+            return Err(anyhow!(
+                "configured dao type hash '{}' does not match node consensus dao type hash '{:#x}'",
+                config.dao_type_hash,
+                consensus.dao_type_hash
+            ));
+        }
+
+        Ok(Self {
+            network_id,
+            genesis_hash: consensus.genesis_hash,
+            dao_type_hash: consensus.dao_type_hash,
+            max_block_bytes: usize::try_from(consensus.max_block_bytes.value())
+                .context("consensus max_block_bytes exceeds platform usize")?,
+            proposal_limit: usize::try_from(consensus.max_block_proposals_limit.value())
+                .context("consensus max_block_proposals_limit exceeds platform usize")?,
+            tx_version: consensus.tx_version.value(),
+            median_time_block_count: usize::try_from(consensus.median_time_block_count.value())
+                .context("consensus median_time_block_count exceeds platform usize")?,
+            finalization_delay_length: consensus.tx_proposal_window.farthest.value() + 1,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedCommittedTransaction {
+    tx: TransactionView,
+    block_hash: H256,
+}
+
+#[derive(Debug, Clone)]
+struct ResolutionIssue {
+    status: CheckStatus,
+    error_code: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone)]
+enum CachedTransaction {
+    Resolved(ResolvedCommittedTransaction),
+    Unavailable(ResolutionIssue),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,52 +213,93 @@ pub struct AuditLog {
     pub coverage: String,
     pub audit_duration_ms: u64,
 
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_block_height: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_parent_hash: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_epoch_continuity: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_timestamp: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_block_size: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_proposal_limit: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_block_hash: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_transaction_hashes: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_transactions_root: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_proposals_hash: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_extra_hash: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_duplicate_transactions: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_duplicate_proposals: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_cellbase_structure: CheckStatus,
 
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_transaction_version: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_inputs_outputs_structure: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_outputs_data_length: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_output_lock_hash_type: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_duplicate_cell_deps: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_duplicate_header_deps: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_duplicate_inputs_in_transaction: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_duplicate_inputs_in_block: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_input_content_resolution: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_input_output_index: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_occupied_capacity: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_ordinary_capacity_conservation: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_input_historical_liveness: CheckStatus,
 
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_cellbase_reward_amount: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_cellbase_reward_target: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_dao_withdraw_capacity: CheckStatus,
 
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_pow: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_expected_epoch_target: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_two_phase_commit: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_cellbase_maturity: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_since: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_extension_consensus_rules: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_vm_scripts: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_cycles: CheckStatus,
 
     pub reward_verification_method: String,
     pub dao_verification_method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reward_target_block_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reward_expected_amount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reward_actual_amount: Option<String>,
 
     pub tx_count: usize,
@@ -210,7 +328,7 @@ impl AuditLog {
     fn new(config: &AuditorConfig, block: &BlockView) -> Self {
         Self {
             timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-            schema_version: 1,
+            schema_version: 2,
             service: "ckb-block-auditor".to_string(),
             auditor_version: env!("CARGO_PKG_VERSION").to_string(),
             network: config.network.clone(),
@@ -247,10 +365,10 @@ impl AuditLog {
             check_duplicate_header_deps: CheckStatus::Unknown,
             check_duplicate_inputs_in_transaction: CheckStatus::Unknown,
             check_duplicate_inputs_in_block: CheckStatus::Unknown,
-            check_input_content_resolution: CheckStatus::Unknown,
-            check_input_output_index: CheckStatus::Unknown,
-            check_occupied_capacity: CheckStatus::Unknown,
-            check_ordinary_capacity_conservation: CheckStatus::Unknown,
+            check_input_content_resolution: CheckStatus::NotApplicable,
+            check_input_output_index: CheckStatus::NotApplicable,
+            check_occupied_capacity: CheckStatus::NotApplicable,
+            check_ordinary_capacity_conservation: CheckStatus::NotApplicable,
             check_input_historical_liveness: CheckStatus::NotImplemented,
 
             check_cellbase_reward_amount: CheckStatus::Unknown,
@@ -355,6 +473,10 @@ impl AuditLog {
                 self.check_ordinary_capacity_conservation,
             ),
             (
+                "check_input_historical_liveness",
+                self.check_input_historical_liveness,
+            ),
+            (
                 "check_cellbase_reward_amount",
                 self.check_cellbase_reward_amount,
             ),
@@ -366,6 +488,20 @@ impl AuditLog {
                 "check_dao_withdraw_capacity",
                 self.check_dao_withdraw_capacity,
             ),
+            ("check_pow", self.check_pow),
+            (
+                "check_expected_epoch_target",
+                self.check_expected_epoch_target,
+            ),
+            ("check_two_phase_commit", self.check_two_phase_commit),
+            ("check_cellbase_maturity", self.check_cellbase_maturity),
+            ("check_since", self.check_since),
+            (
+                "check_extension_consensus_rules",
+                self.check_extension_consensus_rules,
+            ),
+            ("check_vm_scripts", self.check_vm_scripts),
+            ("check_cycles", self.check_cycles),
         ];
 
         self.failed_checks = checks
@@ -394,15 +530,17 @@ impl AuditLog {
 #[async_trait]
 pub trait CkbRpc: Send + Sync {
     async fn get_tip_header(&self) -> Result<Option<HeaderView>>;
+    async fn get_block(&self, hash: &H256) -> Result<Option<BlockView>>;
     async fn get_header_by_number(&self, number: u64) -> Result<Option<HeaderView>>;
     async fn get_header(&self, hash: &H256) -> Result<Option<HeaderView>>;
     async fn get_block_by_number(&self, number: u64) -> Result<Option<BlockView>>;
     async fn get_transaction(&self, hash: &H256) -> Result<Option<TransactionWithStatusResponse>>;
     async fn get_block_economic_state(&self, hash: &H256) -> Result<Option<BlockEconomicState>>;
+    async fn get_consensus(&self) -> Result<RpcConsensus>;
     async fn calculate_dao_maximum_withdraw(
         &self,
         out_point: OutPoint,
-        withdraw_block_hash: H256,
+        kind: DaoWithdrawingCalculationKind,
     ) -> Result<Option<Uint64>>;
 }
 
@@ -441,19 +579,44 @@ impl HttpRpc {
             });
             match self.client.post(&self.url).json(&payload).send().await {
                 Ok(resp) => {
-                    let value: serde_json::Value = resp.json().await.context("invalid rpc json")?;
+                    let status = resp.status();
+                    if !status.is_success() {
+                        let body = resp.text().await.unwrap_or_default();
+                        last_err = Some(anyhow!(
+                            "rpc {} http status {}{}",
+                            method,
+                            status,
+                            if body.is_empty() {
+                                String::new()
+                            } else {
+                                format!(": {}", body.trim())
+                            }
+                        ));
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    let value: serde_json::Value = resp
+                        .json()
+                        .await
+                        .with_context(|| format!("rpc {method} invalid json"))?;
                     if let Some(err) = value.get("error") {
                         last_err = Some(anyhow!("rpc {} error: {}", method, err));
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         continue;
                     }
                     let result = value
                         .get("result")
                         .ok_or_else(|| anyhow!("rpc {} missing result", method))?
                         .clone();
-                    return serde_json::from_value(result).context("rpc result decode failed");
+                    return serde_json::from_value(result)
+                        .with_context(|| format!("rpc {method} result decode failed"));
                 }
                 Err(err) => {
-                    last_err = Some(anyhow!("rpc {} request failed: {}", method, err));
+                    last_err = Some(anyhow!(
+                        "rpc {} request failed: {}",
+                        method,
+                        err.without_url()
+                    ));
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -466,6 +629,11 @@ impl HttpRpc {
 impl CkbRpc for HttpRpc {
     async fn get_tip_header(&self) -> Result<Option<HeaderView>> {
         self.call("get_tip_header", json!([])).await
+    }
+
+    async fn get_block(&self, hash: &H256) -> Result<Option<BlockView>> {
+        self.call("get_block", json!([format!("{hash:#x}"), "0x2", false]))
+            .await
     }
 
     async fn get_header_by_number(&self, number: u64) -> Result<Option<HeaderView>> {
@@ -485,7 +653,7 @@ impl CkbRpc for HttpRpc {
     async fn get_transaction(&self, hash: &H256) -> Result<Option<TransactionWithStatusResponse>> {
         self.call(
             "get_transaction",
-            json!([format!("{hash:#x}"), {"only_committed": true}]),
+            json!([format!("{hash:#x}"), "0x2", true]),
         )
         .await
     }
@@ -495,16 +663,17 @@ impl CkbRpc for HttpRpc {
             .await
     }
 
+    async fn get_consensus(&self) -> Result<RpcConsensus> {
+        self.call("get_consensus", json!([])).await
+    }
+
     async fn calculate_dao_maximum_withdraw(
         &self,
         out_point: OutPoint,
-        withdraw_block_hash: H256,
+        kind: DaoWithdrawingCalculationKind,
     ) -> Result<Option<Uint64>> {
-        self.call(
-            "calculate_dao_maximum_withdraw",
-            json!([out_point, format!("{withdraw_block_hash:#x}")]),
-        )
-        .await
+        self.call("calculate_dao_maximum_withdraw", json!([out_point, kind]))
+            .await
     }
 }
 
@@ -536,6 +705,7 @@ pub struct Auditor<R: CkbRpc> {
     rpc: Arc<R>,
     config: AuditorConfig,
     sink: LogSink,
+    consensus_cache: tokio::sync::Mutex<Option<ConsensusSnapshot>>,
 }
 
 impl<R: CkbRpc> Auditor<R> {
@@ -545,7 +715,12 @@ impl<R: CkbRpc> Auditor<R> {
             .as_ref()
             .map(|p| LogSink::File(p.clone()))
             .unwrap_or(LogSink::Stdout);
-        Self { rpc, config, sink }
+        Self {
+            rpc,
+            config,
+            sink,
+            consensus_cache: tokio::sync::Mutex::new(None),
+        }
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -651,15 +826,98 @@ impl<R: CkbRpc> Auditor<R> {
             .unwrap_or(state.last_height))
     }
 
+    async fn consensus(&self) -> Result<ConsensusSnapshot> {
+        if let Some(cached) = self.consensus_cache.lock().await.clone() {
+            return Ok(cached);
+        }
+
+        let fetched = ConsensusSnapshot::from_rpc(&self.config, self.rpc.get_consensus().await?)
+            .context("invalid node consensus")?;
+        *self.consensus_cache.lock().await = Some(fetched.clone());
+        Ok(fetched)
+    }
+
+    fn push_unknown_detail(
+        &self,
+        log: &mut AuditLog,
+        check_name: &str,
+        error_code: &str,
+        reason: String,
+    ) {
+        log.push_detail(
+            &self.config,
+            DetailItem {
+                check_name: check_name.to_string(),
+                status: CheckStatus::Unknown,
+                error_code: error_code.to_string(),
+                tx_hash: None,
+                tx_index: None,
+                input_index: None,
+                output_index: None,
+                referenced_out_point: None,
+                expected_operator: None,
+                expected_value: None,
+                actual_value: None,
+                unit: None,
+                reason,
+            },
+        );
+    }
+
     async fn audit_block(&self, block: &BlockView) -> AuditLog {
         let started = Instant::now();
         let mut log = AuditLog::new(&self.config, block);
+        log.canonical_at_audit = matches!(
+            self.rpc
+                .get_header_by_number(block.header.inner.number.value())
+                .await,
+            Ok(Some(current)) if current.hash == block.header.hash
+        );
         let core_block: CoreBlockView = block.clone().into();
+        let consensus = self.consensus().await;
 
-        self.audit_header_and_block(block, &core_block, &mut log)
+        self.audit_header_and_block(block, &core_block, &mut log, consensus.as_ref().ok())
             .await;
-        self.audit_transactions(block, &core_block, &mut log).await;
-        self.audit_reward(block, &mut log).await;
+        self.audit_transactions(block, &core_block, &mut log, consensus.as_ref().ok())
+            .await;
+        self.audit_reward(block, &mut log, consensus.as_ref().ok())
+            .await;
+
+        if let Err(err) = &consensus {
+            let reason = format!("get_consensus unavailable: {err}");
+            log.check_timestamp = merge_status(log.check_timestamp, CheckStatus::Unknown);
+            log.check_block_size = merge_status(log.check_block_size, CheckStatus::Unknown);
+            log.check_proposal_limit = merge_status(log.check_proposal_limit, CheckStatus::Unknown);
+            log.check_transaction_version =
+                merge_status(log.check_transaction_version, CheckStatus::Unknown);
+            log.check_ordinary_capacity_conservation = merge_status(
+                log.check_ordinary_capacity_conservation,
+                CheckStatus::Unknown,
+            );
+            log.check_cellbase_reward_amount =
+                merge_status(log.check_cellbase_reward_amount, CheckStatus::Unknown);
+            log.check_cellbase_reward_target =
+                merge_status(log.check_cellbase_reward_target, CheckStatus::Unknown);
+            log.check_dao_withdraw_capacity =
+                merge_status(log.check_dao_withdraw_capacity, CheckStatus::Unknown);
+            for check_name in [
+                "check_timestamp",
+                "check_block_size",
+                "check_proposal_limit",
+                "check_transaction_version",
+                "check_ordinary_capacity_conservation",
+                "check_cellbase_reward_amount",
+                "check_cellbase_reward_target",
+                "check_dao_withdraw_capacity",
+            ] {
+                self.push_unknown_detail(
+                    &mut log,
+                    check_name,
+                    "CONSENSUS_UNAVAILABLE",
+                    reason.clone(),
+                );
+            }
+        }
 
         log.audit_duration_ms = started.elapsed().as_millis() as u64;
         log.finalize();
@@ -671,6 +929,7 @@ impl<R: CkbRpc> Auditor<R> {
         block: &BlockView,
         core_block: &CoreBlockView,
         log: &mut AuditLog,
+        consensus: Option<&ConsensusSnapshot>,
     ) {
         let header_number = block.header.inner.number.value();
 
@@ -696,6 +955,7 @@ impl<R: CkbRpc> Auditor<R> {
                                 tx_index: None,
                                 input_index: None,
                                 output_index: None,
+                                referenced_out_point: None,
                                 expected_operator: Some("less_than_or_equal".to_string()),
                                 expected_value: Some((parent_number + 1).to_string()),
                                 actual_value: Some(header_number.to_string()),
@@ -733,6 +993,7 @@ impl<R: CkbRpc> Auditor<R> {
                                 tx_index: None,
                                 input_index: None,
                                 output_index: None,
+                                referenced_out_point: None,
                                 expected_operator: None,
                                 expected_value: None,
                                 actual_value: None,
@@ -742,25 +1003,61 @@ impl<R: CkbRpc> Auditor<R> {
                         );
                     }
 
-                    let mut timestamps = vec![parent.inner.timestamp.value()];
-                    let mut walk_hash = parent.inner.parent_hash;
-                    for _ in 0..self.config.median_time_span.saturating_sub(1) {
-                        match self.rpc.get_header(&walk_hash).await {
-                            Ok(Some(h)) => {
-                                timestamps.push(h.inner.timestamp.value());
-                                walk_hash = h.inner.parent_hash;
+                    if let Some(consensus) = consensus {
+                        let mut timestamps = vec![parent.inner.timestamp.value()];
+                        let mut walk_hash = parent.inner.parent_hash;
+                        let mut complete = true;
+                        for _ in 0..consensus.median_time_block_count.saturating_sub(1) {
+                            if walk_hash == H256::default() {
+                                break;
                             }
-                            _ => break,
+                            match self.rpc.get_header(&walk_hash).await {
+                                Ok(Some(h)) => {
+                                    timestamps.push(h.inner.timestamp.value());
+                                    walk_hash = h.inner.parent_hash;
+                                }
+                                Ok(None) => {
+                                    complete = false;
+                                    break;
+                                }
+                                Err(err) => {
+                                    complete = false;
+                                    self.push_unknown_detail(
+                                        log,
+                                        "check_timestamp",
+                                        "TIMESTAMP_ANCESTOR_UNAVAILABLE",
+                                        format!("timestamp ancestor lookup failed: {err}"),
+                                    );
+                                    break;
+                                }
+                            }
                         }
-                    }
-                    timestamps.sort_unstable();
-                    let median = timestamps[timestamps.len() / 2];
-                    let ts = block.header.inner.timestamp.value();
-                    let now_ms = Utc::now().timestamp_millis().max(0) as u64;
-                    if ts > median && ts <= now_ms.saturating_add(self.config.max_future_ms) {
-                        log.check_timestamp = CheckStatus::Pass;
+                        if complete || timestamps.len() == consensus.median_time_block_count {
+                            timestamps.sort_unstable();
+                            let median = timestamps[timestamps.len() / 2];
+                            let ts = block.header.inner.timestamp.value();
+                            let now_ms = Utc::now().timestamp_millis().max(0) as u64;
+                            if ts > median && ts <= now_ms.saturating_add(self.config.max_future_ms)
+                            {
+                                log.check_timestamp = CheckStatus::Pass;
+                            } else {
+                                log.check_timestamp = CheckStatus::Fail;
+                            }
+                        } else {
+                            log.check_timestamp = CheckStatus::Unknown;
+                            self.push_unknown_detail(
+                                log,
+                                "check_timestamp",
+                                "TIMESTAMP_MEDIAN_INCOMPLETE",
+                                format!(
+                                    "need {} ancestor timestamps, resolved {}",
+                                    consensus.median_time_block_count,
+                                    timestamps.len()
+                                ),
+                            );
+                        }
                     } else {
-                        log.check_timestamp = CheckStatus::Fail;
+                        log.check_timestamp = CheckStatus::Unknown;
                     }
                 }
                 Ok(None) => {
@@ -787,6 +1084,7 @@ impl<R: CkbRpc> Auditor<R> {
                                 tx_index: None,
                                 input_index: None,
                                 output_index: None,
+                                referenced_out_point: None,
                                 expected_operator: None,
                                 expected_value: None,
                                 actual_value: None,
@@ -806,17 +1104,21 @@ impl<R: CkbRpc> Auditor<R> {
         let block_data: packed::Block = core_block.data();
         let actual_block_size = block_data.serialized_size_without_uncle_proposals();
         log.block_consensus_size_bytes = actual_block_size;
-        log.block_consensus_size_limit_bytes = 597_688_320;
-        log.check_block_size = if actual_block_size <= log.block_consensus_size_limit_bytes {
-            CheckStatus::Pass
+        if let Some(consensus) = consensus {
+            log.block_consensus_size_limit_bytes = consensus.max_block_bytes;
+            log.check_block_size = if actual_block_size <= log.block_consensus_size_limit_bytes {
+                CheckStatus::Pass
+            } else {
+                CheckStatus::Fail
+            };
+            log.check_proposal_limit = if block.proposals.len() <= consensus.proposal_limit {
+                CheckStatus::Pass
+            } else {
+                CheckStatus::Fail
+            };
         } else {
-            CheckStatus::Fail
-        };
-
-        log.check_proposal_limit = if block.proposals.len() <= self.config.proposal_limit {
-            CheckStatus::Pass
-        } else {
-            CheckStatus::Fail
+            log.check_block_size = CheckStatus::Unknown;
+            log.check_proposal_limit = CheckStatus::Unknown;
         };
 
         let computed_header_hash: H256 = core_block.data().header().calc_header_hash().unpack();
@@ -892,10 +1194,14 @@ impl<R: CkbRpc> Auditor<R> {
             CheckStatus::Pass
         };
 
-        log.check_cellbase_structure = self.check_cellbase_structure(block);
+        log.check_cellbase_structure = self.check_cellbase_structure(block, consensus);
     }
 
-    fn check_cellbase_structure(&self, block: &BlockView) -> CheckStatus {
+    fn check_cellbase_structure(
+        &self,
+        block: &BlockView,
+        _consensus: Option<&ConsensusSnapshot>,
+    ) -> CheckStatus {
         let Some(first_tx) = block.transactions.first() else {
             return CheckStatus::Fail;
         };
@@ -939,16 +1245,210 @@ impl<R: CkbRpc> Auditor<R> {
             return CheckStatus::Fail;
         }
 
-        if let Some(output) = first_tx.inner.outputs.first() {
-            if !output.type_.is_none() {
-                return CheckStatus::Fail;
-            }
-            if output.lock.hash_type == ScriptHashType::Data2 {
-                return CheckStatus::Fail;
-            }
+        if let Some(output) = first_tx.inner.outputs.first()
+            && !output.type_.is_none()
+        {
+            return CheckStatus::Fail;
+        }
+        if first_tx
+            .inner
+            .outputs_data
+            .first()
+            .is_some_and(|data| !data.as_bytes().is_empty())
+        {
+            return CheckStatus::Fail;
         }
 
         CheckStatus::Pass
+    }
+
+    async fn fetch_committed_transaction(&self, hash: &H256) -> CachedTransaction {
+        match self.rpc.get_transaction(hash).await {
+            Ok(Some(resp)) => {
+                if resp.tx_status.status != Status::Committed {
+                    return CachedTransaction::Unavailable(ResolutionIssue {
+                        status: CheckStatus::Unknown,
+                        error_code: "INPUT_TX_NOT_COMMITTED".to_string(),
+                        reason: format!(
+                            "get_transaction returned non-committed status {:?}",
+                            resp.tx_status.status
+                        ),
+                    });
+                }
+
+                let Some(block_hash) = resp.tx_status.block_hash else {
+                    return CachedTransaction::Unavailable(ResolutionIssue {
+                        status: CheckStatus::Unknown,
+                        error_code: "INPUT_TX_BLOCK_HASH_MISSING".to_string(),
+                        reason: "committed transaction response missing tx_status.block_hash"
+                            .to_string(),
+                    });
+                };
+
+                let Some(tx) = resp
+                    .transaction
+                    .and_then(|r: ResponseFormat<TransactionView>| match r.inner {
+                        Either::Left(v) => Some(v),
+                        Either::Right(_) => None,
+                    })
+                else {
+                    return CachedTransaction::Unavailable(ResolutionIssue {
+                        status: CheckStatus::Unknown,
+                        error_code: "INPUT_TX_JSON_MISSING".to_string(),
+                        reason: "committed transaction response missing full JSON transaction"
+                            .to_string(),
+                    });
+                };
+
+                let recomputed: H256 = packed::Transaction::from(tx.inner.clone())
+                    .calc_tx_hash()
+                    .unpack();
+                if recomputed != *hash {
+                    return CachedTransaction::Unavailable(ResolutionIssue {
+                        status: CheckStatus::Fail,
+                        error_code: "INPUT_TX_HASH_MISMATCH".to_string(),
+                        reason: format!(
+                            "recomputed source transaction hash {:#x} does not match requested hash {hash:#x}",
+                            recomputed
+                        ),
+                    });
+                }
+
+                CachedTransaction::Resolved(ResolvedCommittedTransaction { tx, block_hash })
+            }
+            Ok(None) => CachedTransaction::Unavailable(ResolutionIssue {
+                status: CheckStatus::Unknown,
+                error_code: "INPUT_TX_MISSING".to_string(),
+                reason: "get_transaction returned null".to_string(),
+            }),
+            Err(err) => CachedTransaction::Unavailable(ResolutionIssue {
+                status: CheckStatus::Unknown,
+                error_code: "INPUT_TX_RPC_ERROR".to_string(),
+                reason: format!("get_transaction failed: {err}"),
+            }),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_input_detail(
+        &self,
+        log: &mut AuditLog,
+        check_name: &str,
+        status: CheckStatus,
+        error_code: &str,
+        tx_hash: &H256,
+        tx_index: usize,
+        input_index: usize,
+        out_point: String,
+        reason: String,
+    ) {
+        log.push_detail(
+            &self.config,
+            DetailItem {
+                check_name: check_name.to_string(),
+                status,
+                error_code: error_code.to_string(),
+                tx_hash: Some(format!("{tx_hash:#x}")),
+                tx_index: Some(tx_index),
+                input_index: Some(input_index),
+                output_index: None,
+                referenced_out_point: Some(out_point),
+                expected_operator: None,
+                expected_value: None,
+                actual_value: None,
+                unit: None,
+                reason,
+            },
+        );
+    }
+
+    fn output_uses_dao_type(
+        output: &ckb_jsonrpc_types::CellOutput,
+        consensus: &ConsensusSnapshot,
+    ) -> bool {
+        output.type_.as_ref().is_some_and(|script| {
+            script.hash_type == ScriptHashType::Type && script.code_hash == consensus.dao_type_hash
+        })
+    }
+
+    async fn resolve_dao_input_capacity(
+        &self,
+        consensus: &ConsensusSnapshot,
+        current_tx: &TransactionView,
+        input: &ckb_jsonrpc_types::CellInput,
+        source: &ResolvedCommittedTransaction,
+        source_output_index: usize,
+    ) -> std::result::Result<u128, ResolutionIssue> {
+        let Some(source_data) = source.tx.inner.outputs_data.get(source_output_index) else {
+            return Err(ResolutionIssue {
+                status: CheckStatus::Fail,
+                error_code: "INPUT_TX_OUTPUT_DATA_MISSING".to_string(),
+                reason: format!(
+                    "source transaction output data missing at index {}",
+                    source_output_index
+                ),
+            });
+        };
+        let (deposit_out_point, calculation_kind) = if source_data
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
+        {
+            let Some(withdrawing_header_hash) = current_tx.inner.header_deps.last().cloned() else {
+                return Err(ResolutionIssue {
+                    status: CheckStatus::Unknown,
+                    error_code: "DAO_WITHDRAW_HEADER_MISSING".to_string(),
+                    reason: "dao deposit input cannot be verified without a withdrawing header reference"
+                        .to_string(),
+                });
+            };
+            (
+                input.previous_output.clone(),
+                DaoWithdrawingCalculationKind::WithdrawingHeaderHash(withdrawing_header_hash),
+            )
+        } else {
+            let deposit_out_point = if source.tx.inner.inputs.len() == 1 {
+                source.tx.inner.inputs[0].previous_output.clone()
+            } else if source_output_index < source.tx.inner.inputs.len() {
+                source.tx.inner.inputs[source_output_index]
+                    .previous_output
+                    .clone()
+            } else {
+                return Err(ResolutionIssue {
+                    status: CheckStatus::Unknown,
+                    error_code: "DAO_DEPOSIT_REFERENCE_AMBIGUOUS".to_string(),
+                    reason: format!(
+                        "cannot unambiguously trace deposit out point for withdrawing cell index {}",
+                        source_output_index
+                    ),
+                });
+            };
+            (
+                deposit_out_point,
+                DaoWithdrawingCalculationKind::WithdrawingOutPoint(input.previous_output.clone()),
+            )
+        };
+
+        match self
+            .rpc
+            .calculate_dao_maximum_withdraw(deposit_out_point, calculation_kind)
+            .await
+        {
+            Ok(Some(v)) => Ok(v.value() as u128),
+            Ok(None) => Err(ResolutionIssue {
+                status: CheckStatus::Unknown,
+                error_code: "DAO_MAXIMUM_WITHDRAW_MISSING".to_string(),
+                reason: format!(
+                    "calculate_dao_maximum_withdraw returned null on network {} ({:#x})",
+                    consensus.network_id, consensus.genesis_hash
+                ),
+            }),
+            Err(err) => Err(ResolutionIssue {
+                status: CheckStatus::Unknown,
+                error_code: "DAO_MAXIMUM_WITHDRAW_RPC_ERROR".to_string(),
+                reason: format!("calculate_dao_maximum_withdraw failed: {err}"),
+            }),
+        }
     }
 
     async fn audit_transactions(
@@ -956,22 +1456,23 @@ impl<R: CkbRpc> Auditor<R> {
         block: &BlockView,
         core_block: &CoreBlockView,
         log: &mut AuditLog,
+        consensus: Option<&ConsensusSnapshot>,
     ) {
-        let mut overall_tx_version = CheckStatus::Pass;
-        let mut overall_struct = CheckStatus::Pass;
-        let mut overall_data_len = CheckStatus::Pass;
-        let mut overall_lock_hash_type = CheckStatus::Pass;
-        let mut overall_dup_cell_dep = CheckStatus::Pass;
-        let mut overall_dup_header_dep = CheckStatus::Pass;
-        let mut overall_dup_input_tx = CheckStatus::Pass;
-        let mut overall_dup_input_block = CheckStatus::Pass;
-        let mut overall_input_resolution = CheckStatus::Pass;
-        let mut overall_input_index = CheckStatus::Pass;
-        let mut overall_occupied_capacity = CheckStatus::Pass;
-        let mut overall_ordinary_capacity = CheckStatus::Pass;
+        let mut overall_tx_version = CheckStatus::NotApplicable;
+        let mut overall_struct = CheckStatus::NotApplicable;
+        let mut overall_data_len = CheckStatus::NotApplicable;
+        let mut overall_lock_hash_type = CheckStatus::NotApplicable;
+        let mut overall_dup_cell_dep = CheckStatus::NotApplicable;
+        let mut overall_dup_header_dep = CheckStatus::NotApplicable;
+        let mut overall_dup_input_tx = CheckStatus::NotApplicable;
+        let mut overall_dup_input_block = CheckStatus::NotApplicable;
+        let mut overall_input_resolution = CheckStatus::NotApplicable;
+        let mut overall_input_index = CheckStatus::NotApplicable;
+        let mut overall_occupied_capacity = CheckStatus::NotApplicable;
+        let mut overall_ordinary_capacity = CheckStatus::NotApplicable;
+        let mut overall_dao_capacity = CheckStatus::NotApplicable;
 
-        let mut input_cache: HashMap<String, Option<(TransactionView, Option<H256>)>> =
-            HashMap::new();
+        let mut input_cache: HashMap<String, CachedTransaction> = HashMap::new();
         let mut block_inputs = HashSet::new();
 
         for (tx_index, tx) in block.transactions.iter().enumerate() {
@@ -981,9 +1482,24 @@ impl<R: CkbRpc> Auditor<R> {
             }
 
             log.capacity_eligible_tx_count += 1;
+            overall_tx_version = merge_status(overall_tx_version, CheckStatus::Pass);
+            overall_struct = merge_status(overall_struct, CheckStatus::Pass);
+            overall_data_len = merge_status(overall_data_len, CheckStatus::Pass);
+            overall_lock_hash_type = merge_status(overall_lock_hash_type, CheckStatus::Pass);
+            overall_dup_cell_dep = merge_status(overall_dup_cell_dep, CheckStatus::Pass);
+            overall_dup_header_dep = merge_status(overall_dup_header_dep, CheckStatus::Pass);
+            overall_dup_input_tx = merge_status(overall_dup_input_tx, CheckStatus::Pass);
+            overall_dup_input_block = merge_status(overall_dup_input_block, CheckStatus::Pass);
+            overall_input_resolution = merge_status(overall_input_resolution, CheckStatus::Pass);
+            overall_input_index = merge_status(overall_input_index, CheckStatus::Pass);
+            overall_occupied_capacity = merge_status(overall_occupied_capacity, CheckStatus::Pass);
 
-            if tx.inner.version.value() != self.config.tx_version {
-                overall_tx_version = merge_status(overall_tx_version, CheckStatus::Fail);
+            if let Some(consensus) = consensus {
+                if tx.inner.version.value() != consensus.tx_version {
+                    overall_tx_version = merge_status(overall_tx_version, CheckStatus::Fail);
+                }
+            } else {
+                overall_tx_version = merge_status(overall_tx_version, CheckStatus::Unknown);
             }
 
             if tx.inner.inputs.is_empty() || tx.inner.outputs.is_empty() {
@@ -992,15 +1508,6 @@ impl<R: CkbRpc> Auditor<R> {
 
             if tx.inner.outputs.len() != tx.inner.outputs_data.len() {
                 overall_data_len = merge_status(overall_data_len, CheckStatus::Fail);
-            }
-
-            if tx
-                .inner
-                .outputs
-                .iter()
-                .any(|o| matches!(o.lock.hash_type, ScriptHashType::Data2))
-            {
-                overall_lock_hash_type = merge_status(overall_lock_hash_type, CheckStatus::Fail);
             }
 
             let mut cell_dep_set = HashSet::new();
@@ -1052,6 +1559,7 @@ impl<R: CkbRpc> Auditor<R> {
             let mut ordinary_input_sum: u128 = 0;
             let mut ordinary_output_sum: u128 = 0;
             let mut tx_unknown = false;
+            let mut classification_unknown = consensus.is_none();
             let mut has_dao_input = false;
             let mut dao_effective_sum: u128 = 0;
 
@@ -1084,110 +1592,124 @@ impl<R: CkbRpc> Auditor<R> {
             for (input_index, input) in tx.inner.inputs.iter().enumerate() {
                 let input_tx_hash = input.previous_output.tx_hash.clone();
                 let key = format!("{:#x}", input_tx_hash);
+                let out_point = format!(
+                    "{:#x}:{}",
+                    input.previous_output.tx_hash,
+                    input.previous_output.index.value()
+                );
 
                 if !input_cache.contains_key(&key) {
-                    let fetched = match self.rpc.get_transaction(&input_tx_hash).await {
-                        Ok(Some(resp)) => {
-                            let tx_opt =
-                                resp.transaction
-                                    .and_then(|r: ResponseFormat<TransactionView>| match r.inner {
-                                        Either::Left(v) => Some(v),
-                                        Either::Right(_) => None,
-                                    });
-                            let block_hash = resp.tx_status.block_hash;
-                            tx_opt.map(|t| (t, block_hash))
-                        }
-                        _ => None,
-                    };
-                    input_cache.insert(key.clone(), fetched);
+                    input_cache.insert(
+                        key.clone(),
+                        self.fetch_committed_transaction(&input_tx_hash).await,
+                    );
                 }
 
-                let Some((input_tx, input_tx_block_hash)) =
-                    input_cache.get(&key).cloned().flatten()
-                else {
-                    tx_unknown = true;
-                    log.unresolved_input_count += 1;
-                    overall_input_resolution =
-                        merge_status(overall_input_resolution, CheckStatus::Unknown);
+                let Some(cached) = input_cache.get(&key).cloned() else {
                     continue;
                 };
-
-                if input_tx.hash != input_tx_hash {
-                    overall_input_resolution =
-                        merge_status(overall_input_resolution, CheckStatus::Fail);
-                    continue;
-                }
+                let resolved = match cached {
+                    CachedTransaction::Resolved(resolved) => resolved,
+                    CachedTransaction::Unavailable(issue) => {
+                        tx_unknown = true;
+                        classification_unknown = true;
+                        log.unresolved_input_count += 1;
+                        overall_input_resolution =
+                            merge_status(overall_input_resolution, issue.status);
+                        overall_input_index =
+                            merge_status(overall_input_index, CheckStatus::Unknown);
+                        self.push_input_detail(
+                            log,
+                            "check_input_content_resolution",
+                            issue.status,
+                            &issue.error_code,
+                            &tx.hash,
+                            tx_index,
+                            input_index,
+                            out_point,
+                            issue.reason,
+                        );
+                        continue;
+                    }
+                };
 
                 let idx = input.previous_output.index.value() as usize;
-                if idx >= input_tx.inner.outputs.len() {
+                if idx >= resolved.tx.inner.outputs.len() {
                     tx_unknown = true;
+                    classification_unknown = true;
                     overall_input_index = merge_status(overall_input_index, CheckStatus::Fail);
+                    self.push_input_detail(
+                        log,
+                        "check_input_output_index",
+                        CheckStatus::Fail,
+                        "INPUT_OUTPUT_INDEX_OUT_OF_RANGE",
+                        &tx.hash,
+                        tx_index,
+                        input_index,
+                        out_point,
+                        format!("source transaction output index {} is out of range", idx),
+                    );
                     continue;
                 }
 
-                let resolved_output = &input_tx.inner.outputs[idx];
-                let is_dao_input = resolved_output.type_.as_ref().is_some_and(|script| {
-                    script.hash_type == ScriptHashType::Type
-                        && format!("{:#x}", script.code_hash)
-                            .eq_ignore_ascii_case(&self.config.dao_type_hash)
-                });
+                let resolved_output = &resolved.tx.inner.outputs[idx];
+                let is_dao_input = consensus
+                    .map(|consensus| Self::output_uses_dao_type(resolved_output, consensus))
+                    .unwrap_or(false);
 
                 if is_dao_input {
                     has_dao_input = true;
-                    if let Some(_prev_block_hash) = input_tx_block_hash {
-                        match self
-                            .rpc
-                            .calculate_dao_maximum_withdraw(
-                                input.previous_output.clone(),
-                                block.header.hash.clone(),
-                            )
-                            .await
-                        {
-                            Ok(Some(v)) => {
-                                dao_effective_sum =
-                                    dao_effective_sum.saturating_add(v.value() as u128);
-                                log.dao_checked_inputs_count += 1;
-                            }
-                            Ok(None) | Err(_) => {
-                                tx_unknown = true;
-                                log.dao_unresolved_inputs_count += 1;
-                            }
+                    match self
+                        .resolve_dao_input_capacity(
+                            consensus.expect("consensus checked above"),
+                            tx,
+                            input,
+                            &resolved,
+                            idx,
+                        )
+                        .await
+                    {
+                        Ok(capacity) => {
+                            dao_effective_sum = dao_effective_sum.saturating_add(capacity);
+                            log.dao_checked_inputs_count += 1;
                         }
-                    } else {
-                        tx_unknown = true;
-                        log.dao_unresolved_inputs_count += 1;
+                        Err(issue) => {
+                            tx_unknown = true;
+                            classification_unknown = true;
+                            log.dao_unresolved_inputs_count += 1;
+                            self.push_input_detail(
+                                log,
+                                "check_dao_withdraw_capacity",
+                                issue.status,
+                                &issue.error_code,
+                                &tx.hash,
+                                tx_index,
+                                input_index,
+                                out_point,
+                                issue.reason,
+                            );
+                        }
                     }
+                } else if consensus.is_none() {
+                    classification_unknown = true;
+                    tx_unknown = true;
+                } else if resolved.block_hash == H256::default() {
+                    tx_unknown = true;
+                    classification_unknown = true;
                 } else {
                     ordinary_input_sum =
                         ordinary_input_sum.saturating_add(resolved_output.capacity.value() as u128);
-                }
-
-                if tx_unknown {
-                    log.push_detail(
-                        &self.config,
-                        DetailItem {
-                            check_name: "check_input_content_resolution".to_string(),
-                            status: CheckStatus::Unknown,
-                            error_code: "INPUT_UNRESOLVED".to_string(),
-                            tx_hash: Some(format!("{:#x}", tx.hash)),
-                            tx_index: Some(tx_index),
-                            input_index: Some(input_index),
-                            output_index: None,
-                            expected_operator: None,
-                            expected_value: None,
-                            actual_value: None,
-                            unit: None,
-                            reason: "input dependency unavailable from rpc".to_string(),
-                        },
-                    );
                 }
             }
 
             if has_dao_input {
                 log.dao_related_tx_count += 1;
                 let expected = ordinary_input_sum.saturating_add(dao_effective_sum);
-                if ordinary_output_sum > expected {
-                    log.check_dao_withdraw_capacity = CheckStatus::Fail;
+                if tx_unknown {
+                    overall_dao_capacity = merge_status(overall_dao_capacity, CheckStatus::Unknown);
+                    log.capacity_unchecked_tx_count += 1;
+                } else if ordinary_output_sum > expected {
+                    overall_dao_capacity = merge_status(overall_dao_capacity, CheckStatus::Fail);
                     log.push_detail(
                         &self.config,
                         DetailItem {
@@ -1198,6 +1720,7 @@ impl<R: CkbRpc> Auditor<R> {
                             tx_index: Some(tx_index),
                             input_index: None,
                             output_index: None,
+                            referenced_out_point: None,
                             expected_operator: Some("less_than_or_equal".to_string()),
                             expected_value: Some(expected.to_string()),
                             actual_value: Some(ordinary_output_sum.to_string()),
@@ -1206,15 +1729,20 @@ impl<R: CkbRpc> Auditor<R> {
                                 .to_string(),
                         },
                     );
-                } else if tx_unknown {
-                    if log.check_dao_withdraw_capacity != CheckStatus::Fail {
-                        log.check_dao_withdraw_capacity = CheckStatus::Unknown;
-                    }
-                } else if log.check_dao_withdraw_capacity != CheckStatus::Fail {
-                    log.check_dao_withdraw_capacity = CheckStatus::Pass;
+                    log.capacity_checked_tx_count += 1;
+                    log.capacity_failed_tx_count += 1;
+                } else {
+                    overall_dao_capacity = merge_status(overall_dao_capacity, CheckStatus::Pass);
+                    log.capacity_checked_tx_count += 1;
                 }
-                log.capacity_checked_tx_count += 1;
+            } else if classification_unknown {
+                overall_ordinary_capacity =
+                    merge_status(overall_ordinary_capacity, CheckStatus::Unknown);
+                overall_dao_capacity = merge_status(overall_dao_capacity, CheckStatus::Unknown);
+                log.capacity_unchecked_tx_count += 1;
             } else {
+                overall_ordinary_capacity =
+                    merge_status(overall_ordinary_capacity, CheckStatus::Pass);
                 if tx_unknown {
                     overall_ordinary_capacity =
                         merge_status(overall_ordinary_capacity, CheckStatus::Unknown);
@@ -1234,6 +1762,7 @@ impl<R: CkbRpc> Auditor<R> {
                             tx_index: Some(tx_index),
                             input_index: None,
                             output_index: None,
+                            referenced_out_point: None,
                             expected_operator: Some("less_than_or_equal".to_string()),
                             expected_value: Some(ordinary_input_sum.to_string()),
                             actual_value: Some(ordinary_output_sum.to_string()),
@@ -1245,10 +1774,6 @@ impl<R: CkbRpc> Auditor<R> {
                     log.capacity_checked_tx_count += 1;
                 }
             }
-        }
-
-        if log.dao_related_tx_count == 0 {
-            log.check_dao_withdraw_capacity = CheckStatus::NotApplicable;
         }
 
         let _ = core_block;
@@ -1264,10 +1789,15 @@ impl<R: CkbRpc> Auditor<R> {
         log.check_input_output_index = overall_input_index;
         log.check_occupied_capacity = overall_occupied_capacity;
         log.check_ordinary_capacity_conservation = overall_ordinary_capacity;
+        log.check_dao_withdraw_capacity = overall_dao_capacity;
     }
 
-    async fn audit_reward(&self, block: &BlockView, log: &mut AuditLog) {
-        let block_hash = block.header.hash.clone();
+    async fn audit_reward(
+        &self,
+        block: &BlockView,
+        log: &mut AuditLog,
+        consensus: Option<&ConsensusSnapshot>,
+    ) {
         let Some(cellbase) = block.transactions.first() else {
             log.check_cellbase_reward_amount = CheckStatus::Fail;
             log.check_cellbase_reward_target = CheckStatus::Unknown;
@@ -1279,19 +1809,201 @@ impl<R: CkbRpc> Auditor<R> {
         });
         log.reward_actual_amount = Some(actual.to_string());
 
-        match self.rpc.get_block_economic_state(&block_hash).await {
+        let Some(consensus) = consensus else {
+            log.check_cellbase_reward_amount = CheckStatus::Unknown;
+            log.check_cellbase_reward_target = CheckStatus::Unknown;
+            return;
+        };
+
+        let block_number = block.header.inner.number.value();
+        if block_number <= consensus.finalization_delay_length {
+            let status = if cellbase.inner.outputs.is_empty() {
+                CheckStatus::Pass
+            } else {
+                CheckStatus::Fail
+            };
+            log.check_cellbase_reward_amount = status;
+            log.check_cellbase_reward_target = status;
+            if status == CheckStatus::Fail {
+                log.push_detail(
+                    &self.config,
+                    DetailItem {
+                        check_name: "check_cellbase_reward_target".to_string(),
+                        status,
+                        error_code: "REWARD_FINALIZATION_NOT_READY".to_string(),
+                        tx_hash: Some(format!("{:#x}", cellbase.hash)),
+                        tx_index: Some(0),
+                        input_index: None,
+                        output_index: None,
+                        referenced_out_point: None,
+                        expected_operator: Some("equal".to_string()),
+                        expected_value: Some("0".to_string()),
+                        actual_value: Some(actual.to_string()),
+                        unit: Some("shannon".to_string()),
+                        reason: "block has no finalized reward target yet, so cellbase outputs must be empty"
+                            .to_string(),
+                    },
+                );
+            }
+            return;
+        }
+
+        let target_number = block_number - consensus.finalization_delay_length;
+        let target_header = match self.rpc.get_header_by_number(target_number).await {
+            Ok(Some(header)) => header,
+            Ok(None) => {
+                log.check_cellbase_reward_amount = CheckStatus::Unknown;
+                log.check_cellbase_reward_target = CheckStatus::Unknown;
+                self.push_unknown_detail(
+                    log,
+                    "check_cellbase_reward_amount",
+                    "REWARD_TARGET_HEADER_MISSING",
+                    format!("target block header missing at height {}", target_number),
+                );
+                return;
+            }
+            Err(err) => {
+                log.check_cellbase_reward_amount = CheckStatus::Unknown;
+                log.check_cellbase_reward_target = CheckStatus::Unknown;
+                self.push_unknown_detail(
+                    log,
+                    "check_cellbase_reward_amount",
+                    "REWARD_TARGET_HEADER_RPC_ERROR",
+                    format!("target block header lookup failed: {err}"),
+                );
+                return;
+            }
+        };
+        let target_hash = target_header.hash;
+        log.reward_target_block_hash = Some(format!("{target_hash:#x}"));
+
+        match self.rpc.get_block_economic_state(&target_hash).await {
             Ok(Some(economic)) => {
                 let expected = economic.miner_reward.primary.value() as u128
                     + economic.miner_reward.secondary.value() as u128
                     + economic.miner_reward.committed.value() as u128
                     + economic.miner_reward.proposal.value() as u128;
                 log.reward_expected_amount = Some(expected.to_string());
-                log.reward_target_block_hash = Some(format!("{:#x}", economic.finalized_at));
 
-                if actual <= expected
-                    || (cellbase.inner.outputs.is_empty()
-                        && expected.saturating_sub(actual) < 61 * 100_000_000u128)
-                {
+                if economic.finalized_at != block.header.hash {
+                    log.check_cellbase_reward_amount = CheckStatus::Unknown;
+                    log.check_cellbase_reward_target = CheckStatus::Unknown;
+                    self.push_unknown_detail(
+                        log,
+                        "check_cellbase_reward_amount",
+                        "REWARD_FINALIZATION_MISMATCH",
+                        format!(
+                            "economic state finalized_at {:#x} does not match audited block hash {:#x}",
+                            economic.finalized_at, block.header.hash
+                        ),
+                    );
+                    return;
+                }
+
+                let target_block = match self.rpc.get_block(&target_hash).await {
+                    Ok(Some(target_block)) if target_block.header.hash == target_hash => {
+                        target_block
+                    }
+                    Ok(Some(_)) => {
+                        log.check_cellbase_reward_amount = CheckStatus::Unknown;
+                        log.check_cellbase_reward_target = CheckStatus::Unknown;
+                        self.push_unknown_detail(
+                            log,
+                            "check_cellbase_reward_target",
+                            "REWARD_TARGET_BLOCK_MISMATCH",
+                            "target block fetched by hash did not match requested hash".to_string(),
+                        );
+                        return;
+                    }
+                    Ok(None) => {
+                        log.check_cellbase_reward_amount = CheckStatus::Unknown;
+                        log.check_cellbase_reward_target = CheckStatus::Unknown;
+                        self.push_unknown_detail(
+                            log,
+                            "check_cellbase_reward_target",
+                            "REWARD_TARGET_BLOCK_MISSING",
+                            format!("target block {} unavailable by hash", target_number),
+                        );
+                        return;
+                    }
+                    Err(err) => {
+                        log.check_cellbase_reward_amount = CheckStatus::Unknown;
+                        log.check_cellbase_reward_target = CheckStatus::Unknown;
+                        self.push_unknown_detail(
+                            log,
+                            "check_cellbase_reward_target",
+                            "REWARD_TARGET_BLOCK_RPC_ERROR",
+                            format!("target block lookup failed: {err}"),
+                        );
+                        return;
+                    }
+                };
+                let Some(target_cellbase) = target_block.transactions.first() else {
+                    log.check_cellbase_reward_amount = CheckStatus::Unknown;
+                    log.check_cellbase_reward_target = CheckStatus::Unknown;
+                    self.push_unknown_detail(
+                        log,
+                        "check_cellbase_reward_target",
+                        "REWARD_TARGET_CELLBASE_MISSING",
+                        "target block is missing cellbase transaction".to_string(),
+                    );
+                    return;
+                };
+                let Some(target_lock) = target_cellbase.inner.witnesses.first().and_then(|w| {
+                    packed::CellbaseWitness::from_slice(w.as_bytes())
+                        .ok()
+                        .map(|x| x.lock())
+                }) else {
+                    log.check_cellbase_reward_amount = CheckStatus::Unknown;
+                    log.check_cellbase_reward_target = CheckStatus::Unknown;
+                    self.push_unknown_detail(
+                        log,
+                        "check_cellbase_reward_target",
+                        "REWARD_TARGET_WITNESS_INVALID",
+                        "target cellbase witness cannot be decoded".to_string(),
+                    );
+                    return;
+                };
+                let expected_lock = ckb_jsonrpc_types::Script::from(target_lock.clone());
+                let insufficient_reward = packed::CellOutput::new_builder()
+                    .capacity(expected as u64)
+                    .lock(target_lock)
+                    .build()
+                    .is_lack_of_capacity(OccupiedCapacity::zero())
+                    .unwrap_or(true);
+
+                if insufficient_reward {
+                    let status = if cellbase.inner.outputs.is_empty() {
+                        CheckStatus::Pass
+                    } else {
+                        CheckStatus::Fail
+                    };
+                    log.check_cellbase_reward_amount = status;
+                    log.check_cellbase_reward_target = status;
+                    if status == CheckStatus::Fail {
+                        log.push_detail(
+                            &self.config,
+                            DetailItem {
+                                check_name: "check_cellbase_reward_target".to_string(),
+                                status,
+                                error_code: "REWARD_BELOW_OCCUPIED_CAPACITY".to_string(),
+                                tx_hash: Some(format!("{:#x}", cellbase.hash)),
+                                tx_index: Some(0),
+                                input_index: None,
+                                output_index: None,
+                                referenced_out_point: None,
+                                expected_operator: Some("equal".to_string()),
+                                expected_value: Some("0".to_string()),
+                                actual_value: Some(actual.to_string()),
+                                unit: Some("shannon".to_string()),
+                                reason: "finalized reward is below the occupied capacity of the correct target lock, so cellbase outputs must be empty".to_string(),
+                            },
+                        );
+                    }
+                    return;
+                }
+
+                if actual == expected {
                     log.check_cellbase_reward_amount = CheckStatus::Pass;
                 } else {
                     log.check_cellbase_reward_amount = CheckStatus::Fail;
@@ -1305,38 +2017,75 @@ impl<R: CkbRpc> Auditor<R> {
                             tx_index: Some(0),
                             input_index: None,
                             output_index: None,
+                            referenced_out_point: None,
                             expected_operator: Some("equal".to_string()),
                             expected_value: Some(expected.to_string()),
                             actual_value: Some(actual.to_string()),
                             unit: Some("shannon".to_string()),
-                            reason: "cellbase output total does not match rpc economic state"
+                            reason: "cellbase output total does not match finalized target block economic state"
                                 .to_string(),
                         },
                     );
                 }
 
-                if expected == 0 {
-                    log.check_cellbase_reward_target = CheckStatus::Unknown;
+                if cellbase.inner.outputs.is_empty() {
+                    log.check_cellbase_reward_target = CheckStatus::Fail;
+                    log.push_detail(
+                        &self.config,
+                        DetailItem {
+                            check_name: "check_cellbase_reward_target".to_string(),
+                            status: CheckStatus::Fail,
+                            error_code: "CELLBASE_REWARD_TARGET_MISSING".to_string(),
+                            tx_hash: Some(format!("{:#x}", cellbase.hash)),
+                            tx_index: Some(0),
+                            input_index: None,
+                            output_index: None,
+                            referenced_out_point: None,
+                            expected_operator: Some("equal".to_string()),
+                            expected_value: None,
+                            actual_value: None,
+                            unit: None,
+                            reason: format!(
+                                "cellbase must include an output paying the finalized target block {} recipient",
+                                target_number
+                            ),
+                        },
+                    );
                 } else {
-                    let lock = cellbase.inner.witnesses.first().and_then(|w| {
-                        packed::CellbaseWitness::from_slice(w.as_bytes())
-                            .ok()
-                            .map(|x| x.lock())
-                    });
-                    if let Some(lock) = lock {
-                        let expected_lock = ckb_jsonrpc_types::Script::from(lock);
-                        if cellbase
-                            .inner
-                            .outputs
-                            .iter()
-                            .all(|o| o.lock == expected_lock)
-                        {
-                            log.check_cellbase_reward_target = CheckStatus::Pass;
-                        } else {
-                            log.check_cellbase_reward_target = CheckStatus::Fail;
-                        }
+                    let paid_to_expected_lock = cellbase
+                        .inner
+                        .outputs
+                        .iter()
+                        .filter(|output| output.lock == expected_lock)
+                        .fold(0u128, |sum, output| {
+                            sum.saturating_add(output.capacity.value() as u128)
+                        });
+
+                    if paid_to_expected_lock == expected {
+                        log.check_cellbase_reward_target = CheckStatus::Pass;
                     } else {
-                        log.check_cellbase_reward_target = CheckStatus::Unknown;
+                        log.check_cellbase_reward_target = CheckStatus::Fail;
+                        log.push_detail(
+                            &self.config,
+                            DetailItem {
+                                check_name: "check_cellbase_reward_target".to_string(),
+                                status: CheckStatus::Fail,
+                                error_code: "CELLBASE_REWARD_TARGET_MISMATCH".to_string(),
+                                tx_hash: Some(format!("{:#x}", cellbase.hash)),
+                                tx_index: Some(0),
+                                input_index: None,
+                                output_index: Some(0),
+                                referenced_out_point: None,
+                                expected_operator: Some("equal".to_string()),
+                                expected_value: Some(expected.to_string()),
+                                actual_value: Some(paid_to_expected_lock.to_string()),
+                                unit: Some("shannon".to_string()),
+                                reason: format!(
+                                    "cellbase outputs locked to target block {} recipient do not carry the full finalized reward",
+                                    target_number
+                                ),
+                            },
+                        );
                     }
                 }
             }
@@ -1353,11 +2102,15 @@ impl<R: CkbRpc> Auditor<R> {
                         tx_index: None,
                         input_index: None,
                         output_index: None,
+                        referenced_out_point: None,
                         expected_operator: None,
                         expected_value: None,
                         actual_value: None,
                         unit: None,
-                        reason: "get_block_economic_state returned null".to_string(),
+                        reason: format!(
+                            "get_block_economic_state returned null for reward target block {} ({target_hash:#x})",
+                            target_number
+                        ),
                     },
                 );
             }
@@ -1374,11 +2127,15 @@ impl<R: CkbRpc> Auditor<R> {
                         tx_index: None,
                         input_index: None,
                         output_index: None,
+                        referenced_out_point: None,
                         expected_operator: None,
                         expected_value: None,
                         actual_value: None,
                         unit: None,
-                        reason: format!("get_block_economic_state failed: {err}"),
+                        reason: format!(
+                            "get_block_economic_state failed for reward target block {} ({target_hash:#x}): {err}",
+                            target_number
+                        ),
                     },
                 );
             }
@@ -1406,14 +2163,22 @@ fn epoch_continuity(parent_value: u64, current_value: u64) -> (bool, String) {
     let parent = EpochNumberWithFraction::from_full_value(parent_value);
     let current = EpochNumberWithFraction::from_full_value(current_value);
 
-    if parent.number() == current.number()
-        && current.index() == parent.index() + 1
-        && current.length() == parent.length()
-    {
-        return (true, String::new());
+    if !current.is_well_formed() {
+        return (
+            false,
+            format!(
+                "invalid current epoch format parent={}:{}:{} current={}:{}:{}",
+                parent.number(),
+                parent.index(),
+                parent.length(),
+                current.number(),
+                current.index(),
+                current.length()
+            ),
+        );
     }
 
-    if current.number() == parent.number() + 1 && current.index() == 0 {
+    if parent.is_genesis() || current.is_successor_of(parent) {
         return (true, String::new());
     }
 
@@ -1437,7 +2202,10 @@ mod tests {
     use ckb_jsonrpc_types::{Capacity, TxStatus};
     use ckb_types::core::{BlockBuilder, HeaderBuilder, TransactionBuilder};
     use ckb_types::packed::{Byte32, CellInput, CellOutput, OutPoint as PackedOutPoint, ScriptOpt};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::sync::Mutex;
+    use std::thread;
 
     #[derive(Default)]
     struct MockRpc {
@@ -1445,15 +2213,25 @@ mod tests {
         headers_by_number: Mutex<HashMap<u64, HeaderView>>,
         headers_by_hash: Mutex<HashMap<String, HeaderView>>,
         blocks_by_number: Mutex<HashMap<u64, BlockView>>,
+        blocks_by_hash: Mutex<HashMap<String, BlockView>>,
         txs: Mutex<HashMap<String, serde_json::Value>>,
         economics: Mutex<HashMap<String, BlockEconomicState>>,
         dao_max: Mutex<HashMap<String, Uint64>>,
+        consensus: Mutex<Option<RpcConsensus>>,
     }
 
     #[async_trait]
     impl CkbRpc for MockRpc {
         async fn get_tip_header(&self) -> Result<Option<HeaderView>> {
             Ok(self.tip.lock().unwrap().clone())
+        }
+        async fn get_block(&self, hash: &H256) -> Result<Option<BlockView>> {
+            Ok(self
+                .blocks_by_hash
+                .lock()
+                .unwrap()
+                .get(&format!("{hash:#x}"))
+                .cloned())
         }
         async fn get_header_by_number(&self, number: u64) -> Result<Option<HeaderView>> {
             Ok(self.headers_by_number.lock().unwrap().get(&number).cloned())
@@ -1493,10 +2271,17 @@ mod tests {
                 .get(&format!("{hash:#x}"))
                 .cloned())
         }
+        async fn get_consensus(&self) -> Result<RpcConsensus> {
+            self.consensus
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| anyhow!("mock consensus missing"))
+        }
         async fn calculate_dao_maximum_withdraw(
             &self,
             out_point: OutPoint,
-            _withdraw_block_hash: H256,
+            _kind: DaoWithdrawingCalculationKind,
         ) -> Result<Option<Uint64>> {
             Ok(self
                 .dao_max
@@ -1552,9 +2337,42 @@ mod tests {
             proposal_limit: 1500,
             tx_version: 0,
             history_retention: 32,
-            dao_type_hash: "0x82d76d1b75c9f0c49f1437f446f40c6f735af754987eb07f76f4c2f2f5f6f2b2"
-                .to_string(),
+            dao_type_hash: String::new(),
         }
+    }
+
+    fn mock_consensus() -> RpcConsensus {
+        mock_consensus_with_limit(0x1000)
+    }
+
+    fn mock_consensus_with_limit(max_block_bytes: u64) -> RpcConsensus {
+        serde_json::from_value(json!({
+            "id": "testnet",
+            "genesis_hash": format!("{:#x}", H256::from([1u8; 32])),
+            "dao_type_hash": format!("{:#x}", H256::from([2u8; 32])),
+            "secp256k1_blake160_sighash_all_type_hash": null,
+            "secp256k1_blake160_multisig_all_type_hash": null,
+            "initial_primary_epoch_reward": "0x0",
+            "secondary_epoch_reward": "0x0",
+            "max_uncles_num": "0x2",
+            "orphan_rate_target": {"numer": "0x1", "denom": "0x2"},
+            "epoch_duration_target": "0x1",
+            "tx_proposal_window": {"closest": "0x2", "farthest": "0xa"},
+            "proposer_reward_ratio": {"numer": "0x2", "denom": "0x5"},
+            "cellbase_maturity": "0x0",
+            "median_time_block_count": "0xb",
+            "max_block_cycles": "0x1",
+            "max_block_bytes": format!("0x{max_block_bytes:x}"),
+            "block_version": "0x0",
+            "tx_version": "0x0",
+            "type_id_code_hash": format!("{:#x}", H256::from([3u8; 32])),
+            "max_block_proposals_limit": "0x5dc",
+            "primary_epoch_reward_halving_interval": "0x1",
+            "permanent_difficulty_in_dummy": false,
+            "hardfork_features": [],
+            "softforks": {}
+        }))
+        .unwrap()
     }
 
     fn simple_lock_script() -> ckb_types::packed::Script {
@@ -1573,6 +2391,79 @@ mod tests {
             .build()
     }
 
+    fn lock_script_with_byte(
+        byte: u8,
+        hash_type: ckb_types::core::ScriptHashType,
+    ) -> ckb_types::packed::Script {
+        ckb_types::packed::Script::new_builder()
+            .code_hash(Byte32::new([byte; 32]))
+            .hash_type(hash_type)
+            .args(ckb_types::bytes::Bytes::new())
+            .build()
+    }
+
+    fn serve_http_once(
+        response_status: &str,
+        response_body: String,
+    ) -> (
+        String,
+        std::sync::Arc<Mutex<String>>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = std::sync::Arc::new(Mutex::new(String::new()));
+        let captured = body.clone();
+        let response_status = response_status.to_string();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|idx| idx + 4)
+                .unwrap();
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let lower = line.to_ascii_lowercase();
+                    lower
+                        .strip_prefix("content-length: ")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            *captured.lock().unwrap() =
+                String::from_utf8_lossy(&request[header_end..header_end + content_length]).into();
+
+            let response = format!(
+                "HTTP/1.1 {response_status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (format!("http://127.0.0.1:{}", addr.port()), body, handle)
+    }
+
     #[tokio::test]
     async fn test_first_startup_anchor_tip_only() {
         let dir = tempfile::tempdir().unwrap();
@@ -1588,6 +2479,7 @@ mod tests {
 
         let rpc = Arc::new(MockRpc::default());
         *rpc.tip.lock().unwrap() = Some(tip_json);
+        *rpc.consensus.lock().unwrap() = Some(mock_consensus());
 
         let auditor = Auditor::new(rpc, cfg);
         let mut cursor = None;
@@ -1669,10 +2561,23 @@ mod tests {
         };
 
         let rpc = Arc::new(MockRpc::default());
+        *rpc.consensus.lock().unwrap() = Some(mock_consensus());
         rpc.headers_by_hash.lock().unwrap().insert(
             format!("{:#x}", block_json.header.inner.parent_hash),
             parent_json.clone(),
         );
+        rpc.headers_by_number
+            .lock()
+            .unwrap()
+            .insert(parent_json.inner.number.value(), parent_json.clone());
+        rpc.headers_by_number.lock().unwrap().insert(
+            block_json.header.inner.number.value(),
+            block_json.header.clone(),
+        );
+        rpc.blocks_by_hash
+            .lock()
+            .unwrap()
+            .insert(format!("{:#x}", block.hash()), block_json.clone());
         rpc.txs.lock().unwrap().insert(
             format!("{:#x}", prev_tx.hash()),
             serde_json::to_value(tx_resp).unwrap(),
@@ -1680,12 +2585,306 @@ mod tests {
         rpc.economics
             .lock()
             .unwrap()
-            .insert(format!("{:#x}", block.hash()), economic);
+            .insert(format!("{:#x}", parent.hash()), economic);
 
         let auditor = Auditor::new(rpc, cfg);
         let log = auditor.audit_block(&block_json).await;
         assert_eq!(log.check_ordinary_capacity_conservation, CheckStatus::Fail);
         assert_eq!(log.result, AuditResult::Fail);
         assert!(!log.failed_checks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_http_get_transaction_uses_full_committed_wire_params() {
+        let prev_tx = TransactionBuilder::default()
+            .version(0u32)
+            .output(simple_cell_output(100))
+            .output_data(ckb_types::bytes::Bytes::new())
+            .build();
+        let prev_tx_json: TransactionView = prev_tx.clone().into();
+        let tx_resp = TransactionWithStatusResponse {
+            transaction: Some(ResponseFormat::json(prev_tx_json)),
+            cycles: None,
+            time_added_to_pool: None,
+            tx_status: TxStatus::committed(1u64.into(), H256::from([9u8; 32]), 0u32.into()),
+            fee: None,
+            min_replace_fee: None,
+        };
+        let response_body = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": tx_resp,
+        }))
+        .unwrap();
+        let (url, body, handle) = serve_http_once("200 OK", response_body);
+        let rpc = HttpRpc::new(url, 5, 0).unwrap();
+        let hash = prev_tx.hash().unpack();
+
+        let response = rpc.get_transaction(&hash).await.unwrap().unwrap();
+        handle.join().unwrap();
+        let captured: serde_json::Value = serde_json::from_str(&body.lock().unwrap()).unwrap();
+        assert_eq!(captured["method"], "get_transaction");
+        assert_eq!(
+            captured["params"],
+            json!([format!("{hash:#x}"), "0x2", true])
+        );
+        assert_eq!(response.tx_status.status, Status::Committed);
+    }
+
+    #[tokio::test]
+    async fn test_http_rpc_error_does_not_leak_credentials() {
+        let (url, _body, handle) = serve_http_once(
+            "500 Internal Server Error",
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"boom"}}"#.to_string(),
+        );
+        let auth_url = format!(
+            "http://{}:{}@{}",
+            "user",
+            "secret",
+            url.trim_start_matches("http://")
+        );
+        let rpc = HttpRpc::new(auth_url, 5, 0).unwrap();
+        let err = rpc.get_consensus().await.unwrap_err().to_string();
+        handle.join().unwrap();
+
+        assert!(err.contains("http status 500"));
+        assert!(!err.contains("secret"));
+        assert!(!err.contains("user:secret"));
+    }
+
+    #[tokio::test]
+    async fn test_reward_uses_finalized_target_block_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path().join("cursor.json"));
+        let target_lock = lock_script_with_byte(7, ckb_types::core::ScriptHashType::Data);
+        let current_witness_lock = lock_script_with_byte(8, ckb_types::core::ScriptHashType::Data);
+
+        let target_header = HeaderBuilder::default()
+            .number(1u64)
+            .timestamp(1000u64)
+            .epoch(EpochNumberWithFraction::new(0, 0, 1000).full_value())
+            .build();
+
+        let target_cellbase = TransactionBuilder::default()
+            .version(0u32)
+            .input(CellInput::new_cellbase_input(1))
+            .output(
+                CellOutput::new_builder()
+                    .capacity(10_000_000_000u64)
+                    .lock(target_lock.clone())
+                    .type_(ScriptOpt::default())
+                    .build(),
+            )
+            .output_data(ckb_types::bytes::Bytes::new())
+            .witness(target_lock.clone().into_witness())
+            .build();
+        let current_cellbase = TransactionBuilder::default()
+            .version(0u32)
+            .input(CellInput::new_cellbase_input(2))
+            .output(
+                CellOutput::new_builder()
+                    .capacity(10_000_000_000u64)
+                    .lock(target_lock.clone())
+                    .type_(ScriptOpt::default())
+                    .build(),
+            )
+            .output_data(ckb_types::bytes::Bytes::new())
+            .witness(current_witness_lock.into_witness())
+            .build();
+
+        let target_block = BlockBuilder::default()
+            .header(target_header.clone())
+            .transaction(target_cellbase)
+            .build();
+        let canonical_target_header = target_block.header().to_owned();
+        let current_header = HeaderBuilder::default()
+            .number(2u64)
+            .timestamp(1200u64)
+            .epoch(EpochNumberWithFraction::new(0, 1, 1000).full_value())
+            .parent_hash(canonical_target_header.hash())
+            .build();
+        let current_block = BlockBuilder::default()
+            .header(current_header.clone())
+            .transaction(current_cellbase)
+            .build();
+        let target_block_json: BlockView = target_block.clone().into();
+        let current_block_json: BlockView = current_block.clone().into();
+
+        let economic = BlockEconomicState {
+            issuance: Default::default(),
+            miner_reward: ckb_jsonrpc_types::MinerReward {
+                primary: Capacity::from(10_000_000_000u64),
+                secondary: Capacity::from(0u64),
+                committed: Capacity::from(0u64),
+                proposal: Capacity::from(0u64),
+            },
+            txs_fee: Capacity::from(0u64),
+            finalized_at: current_block.hash().unpack(),
+        };
+
+        let rpc = Arc::new(MockRpc::default());
+        let mut consensus_value = serde_json::to_value(mock_consensus_with_limit(0x1000)).unwrap();
+        consensus_value["tx_proposal_window"] = json!({"closest": "0x0", "farthest": "0x0"});
+        *rpc.consensus.lock().unwrap() = Some(serde_json::from_value(consensus_value).unwrap());
+        rpc.headers_by_hash.lock().unwrap().insert(
+            format!("{:#x}", canonical_target_header.hash()),
+            canonical_target_header.clone().into(),
+        );
+        rpc.headers_by_number
+            .lock()
+            .unwrap()
+            .insert(1, canonical_target_header.clone().into());
+        rpc.headers_by_number
+            .lock()
+            .unwrap()
+            .insert(2, current_header.clone().into());
+        rpc.blocks_by_hash.lock().unwrap().insert(
+            format!("{:#x}", canonical_target_header.hash()),
+            target_block_json,
+        );
+        rpc.economics
+            .lock()
+            .unwrap()
+            .insert(format!("{:#x}", canonical_target_header.hash()), economic);
+
+        let auditor = Auditor::new(rpc, cfg);
+        let log = auditor.audit_block(&current_block_json).await;
+        eprintln!("{:?}", serde_json::to_value(&log).unwrap());
+        assert_eq!(log.check_cellbase_reward_amount, CheckStatus::Pass);
+        assert_eq!(log.check_cellbase_reward_target, CheckStatus::Pass);
+        assert_eq!(
+            log.reward_target_block_hash,
+            Some(format!("{:#x}", canonical_target_header.hash()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unresolved_input_keeps_unknowns_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path().join("cursor.json"));
+        let parent = HeaderBuilder::default()
+            .number(1u64)
+            .timestamp(1000u64)
+            .epoch(EpochNumberWithFraction::new(0, 0, 1000).full_value())
+            .build();
+        let cellbase = TransactionBuilder::default()
+            .version(0u32)
+            .input(CellInput::new_cellbase_input(2))
+            .output(simple_cell_output(100))
+            .output_data(ckb_types::bytes::Bytes::new())
+            .witness(simple_lock_script().into_witness())
+            .build();
+        let missing_prev = PackedOutPoint::new(Byte32::new([5u8; 32]), 0);
+        let spend_tx = TransactionBuilder::default()
+            .version(0u32)
+            .input(CellInput::new(missing_prev, 0))
+            .output(simple_cell_output(1))
+            .output_data(ckb_types::bytes::Bytes::new())
+            .build();
+        let block = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(2u64)
+                    .timestamp(1200u64)
+                    .epoch(EpochNumberWithFraction::new(0, 1, 1000).full_value())
+                    .parent_hash(parent.hash())
+                    .build(),
+            )
+            .transaction(cellbase)
+            .transaction(spend_tx)
+            .build();
+        let block_json: BlockView = block.clone().into();
+
+        let rpc = Arc::new(MockRpc::default());
+        *rpc.consensus.lock().unwrap() = Some(mock_consensus());
+        rpc.headers_by_hash
+            .lock()
+            .unwrap()
+            .insert(format!("{:#x}", parent.hash()), parent.clone().into());
+        rpc.headers_by_number
+            .lock()
+            .unwrap()
+            .insert(2, block_json.header.clone());
+
+        let auditor = Auditor::new(rpc, cfg);
+        let log = auditor.audit_block(&block_json).await;
+        let serialized = serde_json::to_value(&log).unwrap();
+        assert_eq!(log.check_input_content_resolution, CheckStatus::Unknown);
+        assert_eq!(log.check_input_output_index, CheckStatus::Unknown);
+        assert_eq!(
+            log.check_ordinary_capacity_conservation,
+            CheckStatus::Unknown
+        );
+        assert_eq!(log.check_dao_withdraw_capacity, CheckStatus::Unknown);
+        assert!(serialized.get("check_dao_withdraw_capacity").is_some());
+        assert!(
+            log.details
+                .iter()
+                .any(|detail| detail.referenced_out_point.as_deref().is_some())
+        );
+    }
+
+    #[test]
+    fn test_serialization_omits_not_implemented_and_not_applicable_checks() {
+        let block = BlockBuilder::default()
+            .header(HeaderBuilder::default().number(0u64).build())
+            .build();
+        let block_json: BlockView = block.into();
+        let mut log = AuditLog::new(&test_config(PathBuf::from("/tmp/cursor.json")), &block_json);
+        log.check_block_height = CheckStatus::Pass;
+        log.check_cellbase_reward_amount = CheckStatus::Unknown;
+        log.finalize();
+
+        let value = serde_json::to_value(&log).unwrap();
+        assert_eq!(value["schema_version"], 2);
+        assert!(value.get("check_block_height").is_some());
+        assert!(value.get("check_cellbase_reward_amount").is_some());
+        assert!(value.get("check_pow").is_none());
+        assert!(value.get("check_dao_withdraw_capacity").is_none());
+        assert!(value.get("reward_target_block_hash").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_block_size_uses_consensus_limit_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path().join("cursor.json"));
+        let block = BlockBuilder::default()
+            .header(HeaderBuilder::default().number(0u64).build())
+            .build();
+        let block_json: BlockView = block.clone().into();
+        let core_block: CoreBlockView = block_json.clone().into();
+        let actual_size = core_block.data().serialized_size_without_uncle_proposals() as u64;
+
+        let rpc = Arc::new(MockRpc::default());
+        let auditor = Auditor::new(rpc, cfg.clone());
+        let pass_consensus =
+            ConsensusSnapshot::from_rpc(&cfg, mock_consensus_with_limit(actual_size)).unwrap();
+
+        let mut pass_log = AuditLog::new(&cfg, &block_json);
+        auditor
+            .audit_header_and_block(
+                &block_json,
+                &core_block,
+                &mut pass_log,
+                Some(&pass_consensus),
+            )
+            .await;
+        assert_eq!(pass_log.check_block_size, CheckStatus::Pass);
+
+        let fail_consensus = ConsensusSnapshot::from_rpc(
+            &cfg,
+            mock_consensus_with_limit(actual_size.saturating_sub(1)),
+        )
+        .unwrap();
+        let mut fail_log = AuditLog::new(&cfg, &block_json);
+        auditor
+            .audit_header_and_block(
+                &block_json,
+                &core_block,
+                &mut fail_log,
+                Some(&fail_consensus),
+            )
+            .await;
+        assert_eq!(fail_log.check_block_size, CheckStatus::Fail);
     }
 }

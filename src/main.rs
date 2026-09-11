@@ -36,11 +36,7 @@ struct Args {
     tx_version: u32,
     #[arg(long, env = "CKB_HISTORY_RETENTION", default_value_t = 256)]
     history_retention: usize,
-    #[arg(
-        long,
-        env = "CKB_DAO_TYPE_HASH",
-        default_value = "0x82d76d1b75c9f0c49f1437f446f40c6f735af754987eb07f76f4c2f2f5f6f2b2"
-    )]
+    #[arg(long, env = "CKB_DAO_TYPE_HASH", default_value = "")]
     dao_type_hash: String,
 }
 
