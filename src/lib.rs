@@ -2051,36 +2051,42 @@ impl<R: CkbRpc> Auditor<R> {
                             ),
                         },
                     );
-                } else if cellbase
-                    .inner
-                    .outputs
-                    .iter()
-                    .all(|o| o.lock == expected_lock)
-                {
-                    log.check_cellbase_reward_target = CheckStatus::Pass;
                 } else {
-                    log.check_cellbase_reward_target = CheckStatus::Fail;
-                    log.push_detail(
-                        &self.config,
-                        DetailItem {
-                            check_name: "check_cellbase_reward_target".to_string(),
-                            status: CheckStatus::Fail,
-                            error_code: "CELLBASE_REWARD_TARGET_MISMATCH".to_string(),
-                            tx_hash: Some(format!("{:#x}", cellbase.hash)),
-                            tx_index: Some(0),
-                            input_index: None,
-                            output_index: Some(0),
-                            referenced_out_point: None,
-                            expected_operator: Some("equal".to_string()),
-                            expected_value: None,
-                            actual_value: None,
-                            unit: None,
-                            reason: format!(
-                                "cellbase output locks do not match target block {} witness lock",
-                                target_number
-                            ),
-                        },
-                    );
+                    let paid_to_expected_lock = cellbase
+                        .inner
+                        .outputs
+                        .iter()
+                        .filter(|output| output.lock == expected_lock)
+                        .fold(0u128, |sum, output| {
+                            sum.saturating_add(output.capacity.value() as u128)
+                        });
+
+                    if paid_to_expected_lock == expected {
+                        log.check_cellbase_reward_target = CheckStatus::Pass;
+                    } else {
+                        log.check_cellbase_reward_target = CheckStatus::Fail;
+                        log.push_detail(
+                            &self.config,
+                            DetailItem {
+                                check_name: "check_cellbase_reward_target".to_string(),
+                                status: CheckStatus::Fail,
+                                error_code: "CELLBASE_REWARD_TARGET_MISMATCH".to_string(),
+                                tx_hash: Some(format!("{:#x}", cellbase.hash)),
+                                tx_index: Some(0),
+                                input_index: None,
+                                output_index: Some(0),
+                                referenced_out_point: None,
+                                expected_operator: Some("equal".to_string()),
+                                expected_value: Some(expected.to_string()),
+                                actual_value: Some(paid_to_expected_lock.to_string()),
+                                unit: Some("shannon".to_string()),
+                                reason: format!(
+                                    "cellbase outputs locked to target block {} recipient do not carry the full finalized reward",
+                                    target_number
+                                ),
+                            },
+                        );
+                    }
                 }
             }
             Ok(None) => {
