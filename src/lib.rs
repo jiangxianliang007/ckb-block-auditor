@@ -647,7 +647,7 @@ impl<R: CkbRpc> Auditor<R> {
             .rpc
             .get_tip_header()
             .await?
-            .map(|h| h.inner.number.value())
+            .map(|h| h.inner.number.value().saturating_sub(1))
             .unwrap_or(state.last_height))
     }
 
@@ -696,7 +696,7 @@ impl<R: CkbRpc> Auditor<R> {
                                 tx_index: None,
                                 input_index: None,
                                 output_index: None,
-                                expected_operator: Some("equal".to_string()),
+                                expected_operator: Some("less_than_or_equal".to_string()),
                                 expected_value: Some((parent_number + 1).to_string()),
                                 actual_value: Some(header_number.to_string()),
                                 unit: Some("block".to_string()),
@@ -807,7 +807,11 @@ impl<R: CkbRpc> Auditor<R> {
         let actual_block_size = block_data.serialized_size_without_uncle_proposals();
         log.block_consensus_size_bytes = actual_block_size;
         log.block_consensus_size_limit_bytes = 597_688_320;
-        log.check_block_size = CheckStatus::Pass;
+        log.check_block_size = if actual_block_size <= log.block_consensus_size_limit_bytes {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Fail
+        };
 
         log.check_proposal_limit = if block.proposals.len() <= self.config.proposal_limit {
             CheckStatus::Pass
@@ -1130,12 +1134,12 @@ impl<R: CkbRpc> Auditor<R> {
 
                 if is_dao_input {
                     has_dao_input = true;
-                    if let Some(prev_block_hash) = input_tx_block_hash {
+                    if let Some(_prev_block_hash) = input_tx_block_hash {
                         match self
                             .rpc
                             .calculate_dao_maximum_withdraw(
                                 input.previous_output.clone(),
-                                prev_block_hash,
+                                block.header.hash.clone(),
                             )
                             .await
                         {
@@ -1284,8 +1288,9 @@ impl<R: CkbRpc> Auditor<R> {
                 log.reward_expected_amount = Some(expected.to_string());
                 log.reward_target_block_hash = Some(format!("{:#x}", economic.finalized_at));
 
-                if expected == actual
-                    || (cellbase.inner.outputs.is_empty() && expected < 61 * 100_000_000u128)
+                if actual <= expected
+                    || (cellbase.inner.outputs.is_empty()
+                        && expected.saturating_sub(actual) < 61 * 100_000_000u128)
                 {
                     log.check_cellbase_reward_amount = CheckStatus::Pass;
                 } else {
@@ -1319,14 +1324,16 @@ impl<R: CkbRpc> Auditor<R> {
                             .map(|x| x.lock())
                     });
                     if let Some(lock) = lock {
-                        if let Some(output) = cellbase.inner.outputs.first() {
-                            if output.lock == ckb_jsonrpc_types::Script::from(lock) {
-                                log.check_cellbase_reward_target = CheckStatus::Pass;
-                            } else {
-                                log.check_cellbase_reward_target = CheckStatus::Fail;
-                            }
+                        let expected_lock = ckb_jsonrpc_types::Script::from(lock);
+                        if cellbase
+                            .inner
+                            .outputs
+                            .iter()
+                            .all(|o| o.lock == expected_lock)
+                        {
+                            log.check_cellbase_reward_target = CheckStatus::Pass;
                         } else {
-                            log.check_cellbase_reward_target = CheckStatus::Unknown;
+                            log.check_cellbase_reward_target = CheckStatus::Fail;
                         }
                     } else {
                         log.check_cellbase_reward_target = CheckStatus::Unknown;
