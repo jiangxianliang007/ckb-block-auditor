@@ -776,7 +776,7 @@ impl<R: CkbRpc> Auditor<R> {
                         ));
                     };
                     let actual_hash = format!("{:#x}", header.hash);
-                    if actual_hash != *expected_hash {
+                    if !actual_hash.eq_ignore_ascii_case(expected_hash) {
                         return Err(anyhow!(
                             "legacy cursor file is missing genesis_hash and cannot be migrated safely because recorded height {} hash '{}' does not match selected rpc hash '{}'; use a fresh cursor file",
                             height,
@@ -1571,7 +1571,7 @@ impl<R: CkbRpc> Auditor<R> {
         let mut proposal_dup = false;
         for proposal_index in 0..block.proposals.len() {
             let p = &block.proposals[proposal_index];
-            let key = format!("{p:?}");
+            let key = p.0.to_vec();
             if !proposal_set.insert(key) {
                 proposal_dup = true;
                 log.push_detail(
@@ -1587,7 +1587,7 @@ impl<R: CkbRpc> Auditor<R> {
                         referenced_out_point: None,
                         expected_operator: None,
                         expected_value: None,
-                        actual_value: Some(format!("{p:?}")),
+                        actual_value: Some(hex::encode(p.0)),
                         unit: Some("proposal".to_string()),
                         reason: "duplicate proposal short id detected within block".to_string(),
                     },
