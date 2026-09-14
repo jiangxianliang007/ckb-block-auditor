@@ -4,7 +4,7 @@ CKB Block Auditor（当前 crate 版本 `0.2.0`）。
 
 通过 **CKB JSON-RPC** 审计当前连接节点看到的规范链区块，输出单行 JSON 日志，方便接入日志采集与告警。
 
-`PASS` 表示：该次审计里**所有适用且已执行的检查项**都通过。
+`PASS` 表示：该区块**所有适用检查都拿到最终结论且全部通过**。重试中的缺数据、RPC 失败、429 冷却等只写 stderr 运行日志，不会先写一条中间 `FAIL` 再恢复成 `PASS`。
 
 ---
 
@@ -70,7 +70,7 @@ cargo build --release --locked
 | `--history-retention` | `CKB_HISTORY_RETENTION` | `256` | cursor 历史哈希保留深度 |
 | `--dao-type-hash` | `CKB_DAO_TYPE_HASH` | 空字符串 | 若配置，要求与 `get_consensus.dao_type_hash` 一致 |
 
-固定退避策略：100ms、200ms、400ms...（指数退避，最大 64 倍基础间隔）。
+普通临时错误使用 100ms、200ms、400ms... 的指数退避（最大 64 倍基础间隔）。HTTP 429 优先遵循服务端 `Retry-After`；若缺失则尝试解析响应体里的 `try again after <Ns>`；仍不可用时回退为 60 秒冷却。
 
 ---
 
@@ -91,7 +91,10 @@ cargo build --release --locked
 ### 规则 FAIL vs 执行 FAIL
 
 - **规则 FAIL**：已拿到足够数据并判定规则不通过；该高度视为已完成，可推进已完成游标
-- **执行 FAIL**：必需数据缺失 / RPC 失败 / 歧义无法解析等导致检查未完成；该高度不视为已完成，后续会继续补审
+- **执行未完成**：必需数据缺失 / RPC 失败 / 429 冷却 / 歧义无法解析等导致检查未完成；该高度不视为已完成，不输出最终区块 JSON，后续会继续补审
+- 同一 `block_hash` 的正常重复轮询或重启补审不会重复追加同结果最终日志；同高度发生重组并出现不同 `block_hash` 时，会分别输出各自最终结果
+- 持久化文件日志会按最近一段已写最终结果做幂等恢复，覆盖“日志已写成功但 cursor 保存失败”的常见重放窗口；stdout 与外部游标/消费者之间不提供跨系统原子 exactly-once，建议下游按 `block_hash` 去重
+- 若长期存在不可恢复的执行错误，工具会持续保留 pending 状态并在 stderr 告警，需要人工检查 RPC/数据源
 
 ### `canonical_at_audit`
 
@@ -102,15 +105,16 @@ cargo build --release --locked
 ## 4. 日志与 schema v4
 
 - `result` 仅有 `PASS` / `FAIL`
-- 完成一次审计尝试后的最终日志里，`check_*` 输出仅有 `PASS` / `FAIL`（`NotApplicable` 不输出）
+- 只有区块得到最终结论时才输出一条审计 JSON；运行中的 pending / 冷却 / 恢复信息只写 stderr
+- 最终日志里的 `check_*` 输出仅有 `PASS` / `FAIL`（`NotApplicable` 不输出）
 - 删除 `coverage` / `unknown_checks`
 - `failed_checks` 汇总所有最终输出为 FAIL 的检查项
 - 即使 `details` 被截断或 `max_details=0`，`failed_checks` 仍完整
 
 `details` 常见字段：
 
-- `failure_kind`：`VALIDATION_FAILED` / `RETRY_EXHAUSTED` / `EXECUTION_FAILED`
-- `rpc_method`、`attempts`、`max_retries`
+- 最终区块审计 JSON 里常见的是 `failure_kind=VALIDATION_FAILED`
+- stderr 运行日志会额外记录待补审的 RPC 方法、区块尝试次数、HTTP 冷却与恢复时间
 - 以及 `tx_hash`、`tx_index`、`input_index`、`output_index`、`expected_*`、`actual_value` 等上下文
 
 检查项数量不是固定值，会随区块内容变化（例如是否存在非 cellbase 交易、是否存在可识别 DAO 输入）。

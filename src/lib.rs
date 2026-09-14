@@ -1,13 +1,15 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::error::Error as StdError;
+use std::fmt;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use ckb_jsonrpc_types::{
     BlockEconomicState, BlockView, Consensus as RpcConsensus, DaoWithdrawingCalculationKind,
     Either, HeaderView, OutPoint, ResponseFormat, ScriptHashType, Status, TransactionView,
@@ -18,11 +20,14 @@ use ckb_types::H256;
 use ckb_types::core::{BlockView as CoreBlockView, EpochNumberWithFraction};
 use ckb_types::packed;
 use ckb_types::prelude::*;
-use reqwest::Client;
+use reqwest::header::RETRY_AFTER;
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 
 const RETRY_BASE_DELAY_MS: u64 = 100;
+const RATE_LIMIT_FALLBACK_DELAY_SECS: u64 = 60;
 
 #[derive(Debug, Clone)]
 pub struct AuditorConfig {
@@ -162,6 +167,162 @@ impl CursorState {
     }
 }
 
+#[derive(Debug)]
+struct ShutdownError {
+    context: &'static str,
+}
+
+impl fmt::Display for ShutdownError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "shutdown signal received {}", self.context)
+    }
+}
+
+impl StdError for ShutdownError {}
+
+fn shutdown_error(context: &'static str) -> anyhow::Error {
+    anyhow!(ShutdownError { context })
+}
+
+fn is_shutdown_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<ShutdownError>().is_some())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EmittedAuditKey {
+    block_hash: String,
+    result: AuditResult,
+}
+
+#[derive(Debug, Default)]
+struct EmittedAuditWindow {
+    keys: VecDeque<EmittedAuditKey>,
+    limit: usize,
+}
+
+impl EmittedAuditWindow {
+    fn load(path: Option<&Path>, limit: usize) -> Self {
+        let mut window = Self {
+            keys: VecDeque::new(),
+            limit: limit.max(1),
+        };
+        let Some(path) = path else {
+            return window;
+        };
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return window;
+        };
+        let recent_lines: Vec<_> = content.lines().rev().take(window.limit).collect();
+        for line in recent_lines.into_iter().rev() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(block_hash) = value.get("block_hash").and_then(|item| item.as_str()) else {
+                continue;
+            };
+            let Some(result) = value.get("result").and_then(|item| item.as_str()) else {
+                continue;
+            };
+            window.remember(EmittedAuditKey {
+                block_hash: block_hash.to_string(),
+                result: match result {
+                    "PASS" => AuditResult::Pass,
+                    "FAIL" => AuditResult::Fail,
+                    _ => continue,
+                },
+            });
+        }
+        window
+    }
+
+    fn contains(&self, key: &EmittedAuditKey) -> bool {
+        self.keys.iter().any(|existing| existing == key)
+    }
+
+    fn remember(&mut self, key: EmittedAuditKey) {
+        if self.contains(&key) {
+            return;
+        }
+        self.keys.push_back(key);
+        while self.keys.len() > self.limit {
+            self.keys.pop_front();
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct RpcCooldownState {
+    deadline: Option<std::time::Duration>,
+    resume_at_utc: Option<DateTime<Utc>>,
+    method: Option<String>,
+    reason: Option<String>,
+}
+
+enum HeightAuditOutcome {
+    Finalized {
+        block: BlockView,
+        log: AuditLog,
+    },
+    Pending {
+        block: BlockView,
+        log: AuditLog,
+        block_attempt: u32,
+        total_block_attempts: u32,
+    },
+}
+
+#[async_trait]
+trait RpcClock: Send + Sync {
+    fn now(&self) -> std::time::Duration;
+    fn now_utc(&self) -> DateTime<Utc>;
+    async fn sleep(
+        &self,
+        delay: std::time::Duration,
+        shutdown: &CancellationToken,
+        context: &'static str,
+    ) -> Result<()>;
+}
+
+struct SystemRpcClock {
+    started_at: std::time::Instant,
+}
+
+impl SystemRpcClock {
+    fn new() -> Self {
+        Self {
+            started_at: std::time::Instant::now(),
+        }
+    }
+}
+
+#[async_trait]
+impl RpcClock for SystemRpcClock {
+    fn now(&self) -> std::time::Duration {
+        self.started_at.elapsed()
+    }
+
+    fn now_utc(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+
+    async fn sleep(
+        &self,
+        delay: std::time::Duration,
+        shutdown: &CancellationToken,
+        context: &'static str,
+    ) -> Result<()> {
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => Ok(()),
+            _ = shutdown.cancelled() => Err(shutdown_error(context)),
+            _ = tokio::signal::ctrl_c() => {
+                shutdown.cancel();
+                Err(shutdown_error(context))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CheckStatus {
@@ -177,7 +338,7 @@ impl CheckStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AuditResult {
     Fail,
@@ -725,6 +886,10 @@ pub trait CkbRpc: Send + Sync {
         out_point: OutPoint,
         kind: DaoWithdrawingCalculationKind,
     ) -> Result<Option<Uint64>>;
+
+    fn has_rate_limit_cooldown(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -732,10 +897,40 @@ pub struct HttpRpc {
     client: Client,
     url: String,
     max_retries: u32,
+    cooldown: Arc<StdMutex<RpcCooldownState>>,
+    shutdown: CancellationToken,
+    clock: Arc<dyn RpcClock>,
 }
 
 impl HttpRpc {
     pub fn new(url: String, timeout_secs: u64, max_retries: u32) -> Result<Self> {
+        Self::new_with_dependencies(
+            url,
+            timeout_secs,
+            max_retries,
+            CancellationToken::new(),
+            Arc::new(SystemRpcClock::new()),
+        )
+    }
+
+    #[cfg(test)]
+    fn new_for_test(
+        url: String,
+        timeout_secs: u64,
+        max_retries: u32,
+        shutdown: CancellationToken,
+        clock: Arc<dyn RpcClock>,
+    ) -> Result<Self> {
+        Self::new_with_dependencies(url, timeout_secs, max_retries, shutdown, clock)
+    }
+
+    fn new_with_dependencies(
+        url: String,
+        timeout_secs: u64,
+        max_retries: u32,
+        shutdown: CancellationToken,
+        clock: Arc<dyn RpcClock>,
+    ) -> Result<Self> {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_secs))
             .build()
@@ -744,7 +939,108 @@ impl HttpRpc {
             client,
             url,
             max_retries,
+            cooldown: Arc::new(StdMutex::new(RpcCooldownState::default())),
+            shutdown,
+            clock,
         })
+    }
+
+    fn current_cooldown_deadline(&self) -> Option<std::time::Duration> {
+        self.cooldown
+            .lock()
+            .unwrap()
+            .deadline
+            .filter(|deadline| *deadline > self.clock.now())
+    }
+
+    async fn wait_for_cooldown(&self) -> Result<()> {
+        loop {
+            let deadline = {
+                let mut state = self.cooldown.lock().unwrap();
+                match state.deadline {
+                    Some(deadline) if deadline > self.clock.now() => Some(deadline),
+                    Some(_) => {
+                        let resume_at = state.resume_at_utc.take().unwrap_or_else(Utc::now);
+                        let method = state.method.take().unwrap_or_else(|| "unknown".to_string());
+                        let reason = state.reason.take().unwrap_or_default();
+                        state.deadline = None;
+                        if reason.is_empty() {
+                            eprintln!(
+                                "rpc cooldown recovered after method={} next_try_at={}",
+                                method,
+                                resume_at.to_rfc3339_opts(SecondsFormat::Millis, true)
+                            );
+                        } else {
+                            eprintln!(
+                                "rpc cooldown recovered after method={} reason={} next_try_at={}",
+                                method,
+                                reason,
+                                resume_at.to_rfc3339_opts(SecondsFormat::Millis, true)
+                            );
+                        }
+                        None
+                    }
+                    None => None,
+                }
+            };
+            let Some(deadline) = deadline else {
+                return Ok(());
+            };
+            self.sleep(
+                deadline.saturating_sub(self.clock.now()),
+                "during rpc cooldown",
+            )
+            .await?;
+        }
+    }
+
+    async fn sleep(&self, delay: std::time::Duration, context: &'static str) -> Result<()> {
+        self.clock.sleep(delay, &self.shutdown, context).await
+    }
+
+    fn parse_retry_after_delay(
+        &self,
+        retry_after: Option<&reqwest::header::HeaderValue>,
+        body: &str,
+    ) -> std::time::Duration {
+        retry_after
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| parse_retry_after_value(value, self.clock.now_utc()))
+            .or_else(|| parse_retry_after_from_body(body))
+            .unwrap_or_else(|| std::time::Duration::from_secs(RATE_LIMIT_FALLBACK_DELAY_SECS))
+    }
+
+    fn record_cooldown(&self, method: &str, delay: std::time::Duration, reason: &str) {
+        let now = self.clock.now();
+        let new_deadline = now + delay;
+        let resume_at_utc = chrono::Duration::from_std(delay)
+            .ok()
+            .map(|delta| self.clock.now_utc() + delta)
+            .unwrap_or_else(|| self.clock.now_utc());
+        let mut state = self.cooldown.lock().unwrap();
+        let prior_deadline = state.deadline.filter(|deadline| *deadline > now);
+        let should_extend = prior_deadline.is_some_and(|deadline| new_deadline > deadline);
+        if prior_deadline.is_none() {
+            eprintln!(
+                "rpc cooldown entered method={} http_status=429 reason={} next_try_at={}",
+                method,
+                sanitize_rate_limit_reason(reason),
+                resume_at_utc.to_rfc3339_opts(SecondsFormat::Millis, true)
+            );
+        } else if should_extend {
+            eprintln!(
+                "rpc cooldown extended method={} http_status=429 reason={} next_try_at={}",
+                method,
+                sanitize_rate_limit_reason(reason),
+                resume_at_utc.to_rfc3339_opts(SecondsFormat::Millis, true)
+            );
+        }
+        if prior_deadline.is_none() || should_extend {
+            state.deadline = Some(new_deadline);
+            state.resume_at_utc = Some(resume_at_utc);
+            state.method = Some(method.to_string());
+            state.reason = Some(sanitize_rate_limit_reason(reason));
+        }
     }
 
     async fn call<T: for<'de> Deserialize<'de>>(
@@ -755,6 +1051,7 @@ impl HttpRpc {
         let mut last_err = None;
         let total_attempts = self.max_retries.saturating_add(1);
         for attempt in 1..=total_attempts {
+            self.wait_for_cooldown().await?;
             let payload = json!({
                 "id": 1,
                 "jsonrpc": "2.0",
@@ -765,19 +1062,24 @@ impl HttpRpc {
                 Ok(resp) => {
                     let status = resp.status();
                     if !status.is_success() {
+                        let retry_after = resp.headers().get(RETRY_AFTER).cloned();
                         let body = resp.text().await.unwrap_or_default();
-                        last_err = Some(anyhow!(
-                            "rpc {} http status {}{}",
+                        if status == StatusCode::TOO_MANY_REQUESTS {
+                            let delay = self.parse_retry_after_delay(retry_after.as_ref(), &body);
+                            self.record_cooldown(method, delay, &body);
+                        }
+                        last_err = Some(anyhow!(format_http_status_error(
                             method,
                             status,
-                            if body.is_empty() {
-                                String::new()
-                            } else {
-                                format!(": {}", body.trim())
-                            }
-                        ));
+                            body.trim(),
+                            attempt
+                        )));
                         if attempt < total_attempts {
-                            tokio::time::sleep(retry_backoff(attempt)).await;
+                            if status == StatusCode::TOO_MANY_REQUESTS {
+                                continue;
+                            }
+                            self.sleep(retry_backoff(attempt), "during rpc retry backoff")
+                                .await?;
                         }
                         continue;
                     }
@@ -788,7 +1090,8 @@ impl HttpRpc {
                     if let Some(err) = value.get("error") {
                         last_err = Some(anyhow!("rpc {} error: {}", method, err));
                         if attempt < total_attempts {
-                            tokio::time::sleep(retry_backoff(attempt)).await;
+                            self.sleep(retry_backoff(attempt), "during rpc retry backoff")
+                                .await?;
                         }
                         continue;
                     }
@@ -801,14 +1104,16 @@ impl HttpRpc {
                 }
                 Err(err) => {
                     last_err = Some(anyhow!(
-                        "rpc {} request failed: {}",
+                        "rpc {} request failed after {} http attempt(s): {}",
                         method,
+                        attempt,
                         err.without_url()
                     ));
                 }
             }
             if attempt < total_attempts {
-                tokio::time::sleep(retry_backoff(attempt)).await;
+                self.sleep(retry_backoff(attempt), "during rpc retry backoff")
+                    .await?;
             }
         }
         Err(last_err.unwrap_or_else(|| anyhow!("rpc {} failed", method)))
@@ -865,6 +1170,10 @@ impl CkbRpc for HttpRpc {
         self.call("calculate_dao_maximum_withdraw", json!([out_point, kind]))
             .await
     }
+
+    fn has_rate_limit_cooldown(&self) -> bool {
+        self.current_cooldown_deadline().is_some()
+    }
 }
 
 pub enum LogSink {
@@ -896,20 +1205,42 @@ pub struct Auditor<R: CkbRpc> {
     config: AuditorConfig,
     sink: LogSink,
     consensus_cache: tokio::sync::Mutex<Option<ConsensusSnapshot>>,
+    emitted_audits: StdMutex<EmittedAuditWindow>,
+    shutdown: CancellationToken,
+    clock: Arc<dyn RpcClock>,
 }
 
 impl<R: CkbRpc> Auditor<R> {
     pub fn new(rpc: Arc<R>, config: AuditorConfig) -> Self {
+        Self::new_with_dependencies(
+            rpc,
+            config,
+            CancellationToken::new(),
+            Arc::new(SystemRpcClock::new()),
+        )
+    }
+
+    fn new_with_dependencies(
+        rpc: Arc<R>,
+        config: AuditorConfig,
+        shutdown: CancellationToken,
+        clock: Arc<dyn RpcClock>,
+    ) -> Self {
         let sink = config
             .log_path
             .as_ref()
             .map(|p| LogSink::File(p.clone()))
             .unwrap_or(LogSink::Stdout);
+        let emitted_audits =
+            EmittedAuditWindow::load(config.log_path.as_deref(), config.history_retention);
         Self {
             rpc,
             config,
             sink,
             consensus_cache: tokio::sync::Mutex::new(None),
+            emitted_audits: StdMutex::new(emitted_audits),
+            shutdown,
+            clock,
         }
     }
 
@@ -917,6 +1248,10 @@ impl<R: CkbRpc> Auditor<R> {
         let mut cursor = self.load_cursor().await?;
         loop {
             if let Err(err) = self.poll_once(&mut cursor).await {
+                if is_shutdown_error(&err) {
+                    eprintln!("shutdown signal received");
+                    return Ok(());
+                }
                 eprintln!("poll error: {err:#}");
             }
             tokio::select! {
@@ -941,6 +1276,68 @@ impl<R: CkbRpc> Auditor<R> {
             state.save(path).await?;
         }
         Ok(())
+    }
+
+    fn write_final_audit_once(&self, log: &AuditLog) -> Result<bool> {
+        let key = EmittedAuditKey {
+            block_hash: log.block_hash.clone(),
+            result: log.result,
+        };
+        let mut emitted = self.emitted_audits.lock().unwrap();
+        if emitted.contains(&key) {
+            eprintln!(
+                "skip duplicate finalized audit output for height {} block {} result {:?}",
+                log.block_height, log.block_hash, log.result
+            );
+            return Ok(false);
+        }
+        let line = serde_json::to_string(log)?;
+        self.sink.write_json_line(&line)?;
+        emitted.remember(key);
+        Ok(true)
+    }
+
+    fn log_pending_audit(
+        &self,
+        block: &BlockView,
+        log: &AuditLog,
+        block_attempt: u32,
+        total_block_attempts: u32,
+    ) {
+        let mut diagnostic = log.clone();
+        self.backfill_anomaly_details(&mut diagnostic);
+        let failed: Vec<&str> = diagnostic
+            .check_statuses()
+            .iter()
+            .filter_map(|(name, status)| (*status == CheckStatus::Fail).then_some(*name))
+            .collect();
+        let unresolved: Vec<&str> = diagnostic
+            .check_statuses()
+            .iter()
+            .filter_map(|(name, status)| (*status == CheckStatus::Unknown).then_some(*name))
+            .collect();
+        let summary = diagnostic
+            .details
+            .as_ref()
+            .map(|details| {
+                details
+                    .iter()
+                    .map(|detail| format!("{}:{}", detail.check_name, detail.error_code))
+                    .take(6)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        eprintln!(
+            "pending audit height {} block {:#x}: block_attempt {}/{} failed_checks={:?} unresolved_checks={:?} diagnostics=[{}]",
+            block.header.inner.number.value(),
+            block.header.hash,
+            block_attempt,
+            total_block_attempts,
+            failed,
+            unresolved,
+            summary
+        );
     }
 
     async fn ensure_cursor_genesis(
@@ -1026,10 +1423,23 @@ impl<R: CkbRpc> Auditor<R> {
                     .then(|| state.next_hash.clone())
                     .flatten()
             });
-            let Some((block, log, completed)) =
-                self.audit_height_with_retries(height, &consensus).await?
-            else {
+            let Some(outcome) = self.audit_height_with_retries(height, &consensus).await? else {
                 break;
+            };
+            let (block, log, completed, block_attempt, total_block_attempts) = match outcome {
+                HeightAuditOutcome::Finalized { block, log } => (block, log, true, None, None),
+                HeightAuditOutcome::Pending {
+                    block,
+                    log,
+                    block_attempt,
+                    total_block_attempts,
+                } => (
+                    block,
+                    log,
+                    false,
+                    Some(block_attempt),
+                    Some(total_block_attempts),
+                ),
             };
             let hash = format!("{:#x}", block.header.hash);
             if pending_hash
@@ -1043,9 +1453,8 @@ impl<R: CkbRpc> Auditor<R> {
                     hash
                 );
             }
-            let line = serde_json::to_string(&log)?;
-            self.sink.write_json_line(&line)?;
             if completed {
+                self.write_final_audit_once(&log)?;
                 if let Some(state) = cursor.as_mut() {
                     state.push_block(height, hash, self.config.history_retention);
                     self.save_cursor(state).await?;
@@ -1061,6 +1470,12 @@ impl<R: CkbRpc> Auditor<R> {
                     eprintln!("initialized cursor at audited tip height {}", height);
                 }
             } else {
+                self.log_pending_audit(
+                    &block,
+                    &log,
+                    block_attempt.unwrap_or(1),
+                    total_block_attempts.unwrap_or(self.config.max_retries.saturating_add(1)),
+                );
                 if let Some(state) = cursor.as_mut() {
                     state.mark_pending(&block, self.config.history_retention);
                     self.save_cursor(state).await?;
@@ -1139,7 +1554,7 @@ impl<R: CkbRpc> Auditor<R> {
         &self,
         height: u64,
         consensus: &ConsensusSnapshot,
-    ) -> Result<Option<(BlockView, AuditLog, bool)>> {
+    ) -> Result<Option<HeightAuditOutcome>> {
         let total_attempts = self.config.max_retries.saturating_add(1);
         for attempt in 1..=total_attempts {
             let Some(block) = self.rpc.get_block_by_number(height).await? else {
@@ -1151,12 +1566,28 @@ impl<R: CkbRpc> Auditor<R> {
                 .await;
             let unresolved = log.has_unresolved_checks();
             let non_retryable = log.has_non_retryable_execution_failure();
-            if unresolved && !non_retryable && attempt < total_attempts {
+            if !unresolved {
+                log.finalize(attempt, self.config.max_retries);
+                return Ok(Some(HeightAuditOutcome::Finalized { block, log }));
+            }
+            if self.rpc.has_rate_limit_cooldown() {
+                return Ok(Some(HeightAuditOutcome::Pending {
+                    block,
+                    log,
+                    block_attempt: attempt,
+                    total_block_attempts: total_attempts,
+                }));
+            }
+            if !non_retryable && attempt < total_attempts {
                 self.wait_for_retry(attempt, height, &block).await?;
                 continue;
             }
-            log.finalize(attempt, self.config.max_retries);
-            return Ok(Some((block, log, !unresolved)));
+            return Ok(Some(HeightAuditOutcome::Pending {
+                block,
+                log,
+                block_attempt: attempt,
+                total_block_attempts: total_attempts,
+            }));
         }
         unreachable!("retry loop must return before exhaustion")
     }
@@ -1171,10 +1602,9 @@ impl<R: CkbRpc> Auditor<R> {
             attempt + 1,
             self.config.max_retries.saturating_add(1)
         );
-        tokio::select! {
-            _ = tokio::time::sleep(delay) => Ok(()),
-            _ = tokio::signal::ctrl_c() => Err(anyhow!("shutdown signal received during retry backoff")),
-        }
+        self.clock
+            .sleep(delay, &self.shutdown, "during retry backoff")
+            .await
     }
 
     fn push_unknown_detail(
@@ -3668,6 +4098,58 @@ fn merge_status(old: CheckStatus, new_status: CheckStatus) -> CheckStatus {
     }
 }
 
+fn sanitize_rate_limit_reason(reason: &str) -> String {
+    reason
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(240)
+        .collect()
+}
+
+fn format_http_status_error(
+    method: &str,
+    status: StatusCode,
+    body: &str,
+    http_attempts: u32,
+) -> String {
+    let suffix = if body.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", body)
+    };
+    format!(
+        "rpc {} http status {} after {} http attempt(s){}",
+        method, status, http_attempts, suffix
+    )
+}
+
+fn parse_retry_after_value(value: &str, now: DateTime<Utc>) -> Option<std::time::Duration> {
+    let trimmed = value.trim();
+    if let Ok(seconds) = trimmed.parse::<u64>() {
+        return Some(std::time::Duration::from_secs(seconds));
+    }
+    let retry_at = chrono::DateTime::parse_from_rfc2822(trimmed)
+        .ok()?
+        .with_timezone(&Utc);
+    if retry_at <= now {
+        return None;
+    }
+    (retry_at - now).to_std().ok()
+}
+
+fn parse_retry_after_from_body(body: &str) -> Option<std::time::Duration> {
+    let lower = body.to_ascii_lowercase();
+    let anchor = lower.find("try again after ")?;
+    let digits: String = lower[anchor + "try again after ".len()..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    let seconds = digits.parse::<u64>().ok()?;
+    Some(std::time::Duration::from_secs(seconds))
+}
+
 fn retry_backoff(attempt: u32) -> std::time::Duration {
     let factor = 1u64 << attempt.saturating_sub(1).min(6);
     std::time::Duration::from_millis(RETRY_BASE_DELAY_MS.saturating_mul(factor))
@@ -3810,7 +4292,9 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
+    use tokio::sync::Notify;
 
     #[derive(Default)]
     struct MockRpc {
@@ -3823,6 +4307,60 @@ mod tests {
         economics: Mutex<HashMap<String, BlockEconomicState>>,
         dao_max: Mutex<HashMap<String, Uint64>>,
         consensus: Mutex<Option<RpcConsensus>>,
+    }
+
+    struct ManualRpcClock {
+        now: StdMutex<std::time::Duration>,
+        base_utc: DateTime<Utc>,
+        notify: Notify,
+    }
+
+    impl ManualRpcClock {
+        fn new(base_utc: DateTime<Utc>) -> Self {
+            Self {
+                now: StdMutex::new(std::time::Duration::ZERO),
+                base_utc,
+                notify: Notify::new(),
+            }
+        }
+
+        fn advance(&self, delay: std::time::Duration) {
+            let mut now = self.now.lock().unwrap();
+            *now += delay;
+            self.notify.notify_waiters();
+        }
+    }
+
+    #[async_trait]
+    impl RpcClock for ManualRpcClock {
+        fn now(&self) -> std::time::Duration {
+            *self.now.lock().unwrap()
+        }
+
+        fn now_utc(&self) -> DateTime<Utc> {
+            chrono::Duration::from_std(*self.now.lock().unwrap())
+                .ok()
+                .map(|delta| self.base_utc + delta)
+                .unwrap_or(self.base_utc)
+        }
+
+        async fn sleep(
+            &self,
+            delay: std::time::Duration,
+            shutdown: &CancellationToken,
+            context: &'static str,
+        ) -> Result<()> {
+            let target = self.now() + delay;
+            loop {
+                if self.now() >= target {
+                    return Ok(());
+                }
+                tokio::select! {
+                    _ = self.notify.notified() => {}
+                    _ = shutdown.cancelled() => return Err(shutdown_error(context)),
+                }
+            }
+        }
     }
 
     #[async_trait]
@@ -4250,6 +4788,58 @@ mod tests {
             stream.write_all(response.as_bytes()).unwrap();
         });
         (format!("http://127.0.0.1:{}", addr.port()), body, handle)
+    }
+
+    #[derive(Clone)]
+    struct TestHttpResponse {
+        status: String,
+        body: String,
+        extra_headers: Vec<(String, String)>,
+    }
+
+    fn serve_http_sequence(
+        responses: Vec<TestHttpResponse>,
+    ) -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let captured = request_count.clone();
+        let handle = thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                captured.fetch_add(1, Ordering::SeqCst);
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+
+                let mut headers = String::new();
+                for (name, value) in response.extra_headers {
+                    headers.push_str(&format!("{name}: {value}\r\n"));
+                }
+                let wire_response = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n{}",
+                    response.status,
+                    response.body.len(),
+                    headers,
+                    response.body
+                );
+                stream.write_all(wire_response.as_bytes()).unwrap();
+            }
+        });
+        (
+            format!("http://127.0.0.1:{}", addr.port()),
+            request_count,
+            handle,
+        )
     }
 
     fn read_log_lines(path: &Path) -> Vec<serde_json::Value> {
@@ -4787,6 +5377,143 @@ mod tests {
         assert!(!err.contains("user:secret"));
     }
 
+    #[test]
+    fn test_parse_retry_after_priority_helpers() {
+        let now = DateTime::parse_from_rfc3339("2026-09-14T08:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            parse_retry_after_value("60", now).unwrap(),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            parse_retry_after_value("Mon, 14 Sep 2026 08:31:00 GMT", now).unwrap(),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            parse_retry_after_from_body(
+                r#"{"error":{"message":"allowed qps exceeded: Too many requests (exceeds 2000), try again after 60s"}}"#
+            )
+            .unwrap(),
+            std::time::Duration::from_secs(60)
+        );
+        assert!(parse_retry_after_value("not-a-delay", now).is_none());
+        assert!(parse_retry_after_value("Mon, 14 Sep 2026 08:29:59 GMT", now).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_http_429_cooldown_is_shared_across_clones_and_methods() {
+        let header = HeaderBuilder::default()
+            .number(9u64)
+            .epoch(EpochNumberWithFraction::new(0, 9, 1000).full_value())
+            .build();
+        let response_body = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": HeaderView::from(header.clone()),
+        }))
+        .unwrap();
+        let (url, request_count, handle) = serve_http_sequence(vec![
+            TestHttpResponse {
+                status: "429 Too Many Requests".to_string(),
+                body: r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"allowed qps exceeded: Too many requests (exceeds 2000), try again after 60s"}}"#.to_string(),
+                extra_headers: vec![("Retry-After".to_string(), "60".to_string())],
+            },
+            TestHttpResponse {
+                status: "200 OK".to_string(),
+                body: response_body,
+                extra_headers: vec![],
+            },
+        ]);
+        let shutdown = CancellationToken::new();
+        let clock = Arc::new(ManualRpcClock::new(
+            DateTime::parse_from_rfc3339("2026-09-14T08:30:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        ));
+        let rpc = HttpRpc::new_for_test(url, 5, 0, shutdown, clock.clone()).unwrap();
+        let clone = rpc.clone();
+
+        let err = rpc.get_consensus().await.unwrap_err().to_string();
+        assert!(err.contains("http status 429"));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+        let wait = tokio::spawn(async move { clone.get_tip_header().await });
+        tokio::task::yield_now().await;
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+        clock.advance(std::time::Duration::from_secs(59));
+        tokio::task::yield_now().await;
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+        clock.advance(std::time::Duration::from_secs(1));
+        let header = wait.await.unwrap().unwrap().unwrap();
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(header.inner.number.value(), 9);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_http_429_extension_persists_across_calls() {
+        let clock = Arc::new(ManualRpcClock::new(
+            DateTime::parse_from_rfc3339("2026-09-14T08:30:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        ));
+        let rpc = HttpRpc::new_for_test(
+            "http://127.0.0.1:8114".to_string(),
+            5,
+            1,
+            CancellationToken::new(),
+            clock.clone(),
+        )
+        .unwrap();
+        rpc.record_cooldown("get_consensus", std::time::Duration::from_secs(60), "first");
+        clock.advance(std::time::Duration::from_secs(60));
+        rpc.record_cooldown(
+            "get_tip_header",
+            std::time::Duration::from_secs(120),
+            "second",
+        );
+        let remaining = rpc
+            .current_cooldown_deadline()
+            .unwrap()
+            .saturating_sub(clock.now());
+        assert_eq!(remaining, std::time::Duration::from_secs(120));
+    }
+
+    #[tokio::test]
+    async fn test_http_429_cooldown_wait_can_be_cancelled() {
+        let (url, request_count, handle) = serve_http_sequence(vec![TestHttpResponse {
+            status: "429 Too Many Requests".to_string(),
+            body: r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"allowed qps exceeded: Too many requests (exceeds 2000), try again after 60s"}}"#.to_string(),
+            extra_headers: vec![("Retry-After".to_string(), "60".to_string())],
+        }]);
+        let shutdown = CancellationToken::new();
+        let clock = Arc::new(ManualRpcClock::new(
+            DateTime::parse_from_rfc3339("2026-09-14T08:30:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        ));
+        let rpc = HttpRpc::new_for_test(url, 5, 0, shutdown.clone(), clock.clone()).unwrap();
+        let err = rpc.get_consensus().await.unwrap_err().to_string();
+        assert!(err.contains("http status 429"));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+        let blocked = {
+            let rpc = rpc.clone();
+            tokio::spawn(async move { rpc.get_tip_header().await })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        shutdown.cancel();
+
+        let cancelled = blocked.await.unwrap().unwrap_err();
+        assert!(is_shutdown_error(&cancelled));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        handle.join().unwrap();
+    }
+
     #[tokio::test]
     async fn test_reward_uses_finalized_target_block_lock() {
         let dir = tempfile::tempdir().unwrap();
@@ -5039,13 +5766,15 @@ mod tests {
 
         let auditor = Auditor::new(rpc.clone(), cfg.clone());
         let consensus = ConsensusSnapshot::from_rpc(&cfg, mock_consensus()).unwrap();
-        let (_, log, completed) = auditor
+        let outcome = auditor
             .audit_height_with_retries(2, &consensus)
             .await
             .unwrap()
             .unwrap();
+        let HeightAuditOutcome::Finalized { log, .. } = outcome else {
+            panic!("expected finalized audit");
+        };
 
-        assert!(completed);
         assert_eq!(log.result, AuditResult::Pass);
         assert!(log.failed_checks.is_none());
         assert!(log.details.is_none());
@@ -5157,25 +5886,10 @@ mod tests {
         *rpc.base.tip.lock().unwrap() = Some(block_3_json.header.clone());
         auditor.poll_once(&mut cursor).await.unwrap();
 
-        let lines = read_log_lines(&log_path);
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0]["block_height"], 2);
-        assert_eq!(lines[1]["block_height"], 2);
-        assert_eq!(lines[0]["result"], "FAIL");
-        assert_eq!(lines[1]["result"], "FAIL");
-        assert!(
-            lines[0]["details"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|detail| {
-                    detail["error_code"] == "INPUT_TX_MISSING"
-                        && detail["failure_kind"] == "RETRY_EXHAUSTED"
-                        && detail["rpc_method"] == "get_transaction"
-                        && detail["attempts"] == 2
-                        && detail["max_retries"] == 1
-                })
-        );
+        assert!(!log_path.exists());
+        let pending = cursor.as_ref().unwrap();
+        assert_eq!(pending.last_height, 1);
+        assert_eq!(pending.next_height, Some(2));
         assert!(!dir.path().join("cursor.json").exists());
     }
 
@@ -5337,29 +6051,242 @@ mod tests {
             .unwrap();
 
         let lines = read_log_lines(&log_path);
-        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.len(), 2);
         assert_eq!(lines[0]["block_height"], 2);
-        assert_eq!(lines[1]["block_height"], 2);
-        assert_eq!(lines[2]["block_height"], 3);
-        assert_eq!(lines[0]["result"], "FAIL");
+        assert_eq!(lines[1]["block_height"], 3);
+        assert_eq!(lines[0]["result"], "PASS");
         assert_eq!(lines[1]["result"], "PASS");
-        assert_eq!(lines[2]["result"], "PASS");
-        assert!(
-            lines[0]["details"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|detail| {
-                    detail["error_code"] == "INPUT_TX_MISSING"
-                        && detail["failure_kind"] == "RETRY_EXHAUSTED"
-                        && detail["attempts"] == 2
-                        && detail["max_retries"] == 1
-                })
-        );
 
         let final_cursor = CursorState::load(&cursor_path).await.unwrap().unwrap();
         assert_eq!(final_cursor.last_height, 3);
         assert!(final_cursor.next_height.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_mixed_rule_fail_and_retry_only_outputs_final_fail_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("audit.log");
+        let mut cfg = test_config(dir.path().join("cursor.json"));
+        cfg.cursor_path = None;
+        cfg.log_path = Some(log_path.clone());
+
+        let parent_block = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(1u64)
+                    .timestamp(1000u64)
+                    .epoch(EpochNumberWithFraction::new(0, 1, 1000).full_value())
+                    .build(),
+            )
+            .transaction(empty_cellbase(1))
+            .build();
+        let prev_tx = TransactionBuilder::default()
+            .version(0u32)
+            .output(simple_cell_output(10_000_000_000))
+            .output_data(ckb_types::bytes::Bytes::new())
+            .build();
+        let spend_tx = TransactionBuilder::default()
+            .version(0u32)
+            .input(CellInput::new(PackedOutPoint::new(prev_tx.hash(), 0), 0))
+            .output(simple_cell_output(10_000_000_000))
+            .output_data(ckb_types::bytes::Bytes::new())
+            .build();
+        let block = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(2u64)
+                    .version(1u32)
+                    .timestamp(1200u64)
+                    .epoch(EpochNumberWithFraction::new(0, 2, 1000).full_value())
+                    .parent_hash(parent_block.header().hash())
+                    .build(),
+            )
+            .transaction(empty_cellbase(2))
+            .transaction(spend_tx.clone())
+            .build();
+        let block_json: BlockView = block.clone().into();
+        let parent_json: HeaderView = parent_block.header().to_owned().into();
+
+        let rpc = Arc::new(RetryRpc::default());
+        *rpc.base.consensus.lock().unwrap() = Some(mock_consensus());
+        *rpc.base.tip.lock().unwrap() = Some(block_json.header.clone());
+        rpc.base
+            .headers_by_hash
+            .lock()
+            .unwrap()
+            .insert(format!("{:#x}", parent_json.hash), parent_json.clone());
+        rpc.base
+            .headers_by_number
+            .lock()
+            .unwrap()
+            .insert(1, parent_json);
+        rpc.base
+            .headers_by_number
+            .lock()
+            .unwrap()
+            .insert(2, block_json.header.clone());
+        rpc.base
+            .blocks_by_number
+            .lock()
+            .unwrap()
+            .insert(2, block_json.clone());
+        rpc.queue_tx_sequence(&prev_tx.hash().unpack(), vec![None]);
+
+        let auditor = Auditor::new(rpc.clone(), cfg);
+        let mut cursor = None;
+        auditor.poll_once(&mut cursor).await.unwrap();
+        assert!(!log_path.exists());
+
+        rpc.base.txs.lock().unwrap().insert(
+            format!("{:#x}", prev_tx.hash()),
+            serde_json::to_value(committed_tx_response(
+                &prev_tx,
+                parent_block.header().hash().unpack(),
+            ))
+            .unwrap(),
+        );
+        auditor.poll_once(&mut cursor).await.unwrap();
+
+        let lines = read_log_lines(&log_path);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["result"], "FAIL");
+        assert!(
+            lines[0]["failed_checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item == "check_block_version")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cursor_save_failure_does_not_duplicate_finalized_log_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let cursor_dir = dir.path().join("cursor-dir");
+        std::fs::create_dir(&cursor_dir).unwrap();
+        let log_path = dir.path().join("audit.log");
+        let mut cfg = test_config(cursor_dir.clone());
+        cfg.log_path = Some(log_path.clone());
+
+        let block = BlockBuilder::default()
+            .header(HeaderBuilder::default().number(0u64).build())
+            .transaction(empty_cellbase(0))
+            .build();
+        let block_json: BlockView = block.clone().into();
+        let header_json: HeaderView = block.header().to_owned().into();
+
+        let rpc = Arc::new(MockRpc::default());
+        *rpc.consensus.lock().unwrap() = Some(mock_consensus());
+        *rpc.tip.lock().unwrap() = Some(header_json.clone());
+        rpc.headers_by_number.lock().unwrap().insert(0, header_json);
+        rpc.blocks_by_number.lock().unwrap().insert(0, block_json);
+
+        let auditor = Auditor::new(rpc.clone(), cfg.clone());
+        let mut cursor = None;
+        let err = auditor
+            .poll_once(&mut cursor)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed to replace cursor file"));
+        let lines = read_log_lines(&log_path);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["result"], "PASS");
+
+        let mut restart_cfg = cfg;
+        restart_cfg.cursor_path = Some(dir.path().join("cursor.json"));
+        let restarted = Auditor::new(rpc, restart_cfg);
+        let mut restarted_cursor = None;
+        restarted.poll_once(&mut restarted_cursor).await.unwrap();
+
+        let lines = read_log_lines(&log_path);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["result"], "PASS");
+    }
+
+    #[tokio::test]
+    async fn test_same_height_reorg_with_different_hash_outputs_both_final_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let cursor_path = dir.path().join("cursor.json");
+        let log_path = dir.path().join("audit.log");
+        let mut cfg = test_config(cursor_path.clone());
+        cfg.log_path = Some(log_path.clone());
+
+        let parent_block = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(1u64)
+                    .epoch(EpochNumberWithFraction::new(0, 1, 1000).full_value())
+                    .build(),
+            )
+            .transaction(empty_cellbase(1))
+            .build();
+        let block_a = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(2u64)
+                    .timestamp(1200u64)
+                    .epoch(EpochNumberWithFraction::new(0, 2, 1000).full_value())
+                    .parent_hash(parent_block.header().hash())
+                    .build(),
+            )
+            .transaction(empty_cellbase(2))
+            .build();
+        let block_b = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(2u64)
+                    .timestamp(1300u64)
+                    .epoch(EpochNumberWithFraction::new(0, 2, 1000).full_value())
+                    .parent_hash(parent_block.header().hash())
+                    .build(),
+            )
+            .transaction(empty_cellbase(2))
+            .build();
+        let parent_json: HeaderView = parent_block.header().to_owned().into();
+        let block_a_json: BlockView = block_a.clone().into();
+        let block_b_json: BlockView = block_b.clone().into();
+
+        let rpc = Arc::new(MockRpc::default());
+        *rpc.consensus.lock().unwrap() = Some(mock_consensus());
+        *rpc.tip.lock().unwrap() = Some(block_a_json.header.clone());
+        rpc.headers_by_hash
+            .lock()
+            .unwrap()
+            .insert(format!("{:#x}", parent_json.hash), parent_json.clone());
+        rpc.headers_by_number
+            .lock()
+            .unwrap()
+            .insert(1, parent_json.clone());
+        rpc.headers_by_number
+            .lock()
+            .unwrap()
+            .insert(2, block_a_json.header.clone());
+        rpc.blocks_by_number
+            .lock()
+            .unwrap()
+            .insert(2, block_a_json.clone());
+
+        let auditor = Auditor::new(rpc.clone(), cfg);
+        let mut cursor = None;
+        auditor.poll_once(&mut cursor).await.unwrap();
+
+        *rpc.tip.lock().unwrap() = Some(block_b_json.header.clone());
+        rpc.headers_by_number
+            .lock()
+            .unwrap()
+            .insert(2, block_b_json.header.clone());
+        rpc.blocks_by_number
+            .lock()
+            .unwrap()
+            .insert(2, block_b_json.clone());
+        auditor.poll_once(&mut cursor).await.unwrap();
+
+        let lines = read_log_lines(&log_path);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["block_height"], 2);
+        assert_eq!(lines[1]["block_height"], 2);
+        assert_ne!(lines[0]["block_hash"], lines[1]["block_hash"]);
     }
 
     #[test]

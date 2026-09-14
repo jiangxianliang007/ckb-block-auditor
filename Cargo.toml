@@ -16,7 +16,8 @@ hex = "0.4.3"
 reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "signal", "time", "fs"] }
+tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "signal", "time", "fs", "test-util"] }
+tokio-util = "0.7.19"
 
 [dev-dependencies]
 tempfile = "3.22.0"
