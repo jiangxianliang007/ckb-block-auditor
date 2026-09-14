@@ -1206,10 +1206,26 @@ pub struct Auditor<R: CkbRpc> {
     sink: LogSink,
     consensus_cache: tokio::sync::Mutex<Option<ConsensusSnapshot>>,
     emitted_audits: StdMutex<EmittedAuditWindow>,
+    shutdown: CancellationToken,
+    clock: Arc<dyn RpcClock>,
 }
 
 impl<R: CkbRpc> Auditor<R> {
     pub fn new(rpc: Arc<R>, config: AuditorConfig) -> Self {
+        Self::new_with_dependencies(
+            rpc,
+            config,
+            CancellationToken::new(),
+            Arc::new(SystemRpcClock::new()),
+        )
+    }
+
+    fn new_with_dependencies(
+        rpc: Arc<R>,
+        config: AuditorConfig,
+        shutdown: CancellationToken,
+        clock: Arc<dyn RpcClock>,
+    ) -> Self {
         let sink = config
             .log_path
             .as_ref()
@@ -1223,6 +1239,8 @@ impl<R: CkbRpc> Auditor<R> {
             sink,
             consensus_cache: tokio::sync::Mutex::new(None),
             emitted_audits: StdMutex::new(emitted_audits),
+            shutdown,
+            clock,
         }
     }
 
@@ -1584,10 +1602,9 @@ impl<R: CkbRpc> Auditor<R> {
             attempt + 1,
             self.config.max_retries.saturating_add(1)
         );
-        tokio::select! {
-            _ = tokio::time::sleep(delay) => Ok(()),
-            _ = tokio::signal::ctrl_c() => Err(shutdown_error("during retry backoff")),
-        }
+        self.clock
+            .sleep(delay, &self.shutdown, "during retry backoff")
+            .await
     }
 
     fn push_unknown_detail(
