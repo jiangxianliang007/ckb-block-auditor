@@ -368,15 +368,14 @@ cargo build --release --locked
 
 - 适用：至少有一个输入引用的**源输出**满足：`type_` 存在，且 `hash_type == Type`、`code_hash == get_consensus.dao_type_hash`。
 - DAO 输入识别：完全基于**源输出 type script**，不是看当前交易输出。
-- `dao_effective_sum` 的来源：对每个 DAO 输入，根据实际可追溯路径调用 `calculate_dao_maximum_withdraw(...)`，把返回的最大可提容量相加。
-- 目标引用追踪规则：
-  - 若源输出 data 全 0：把该输入当作 DAO deposit cell，要求当前交易 `header_deps.last()` 存在，并以 `WithdrawingHeaderHash(last_header_dep)` 方式计算；
-  - 否则：把该输入当作 withdrawing cell，继续向前追其 deposit out point；若源交易只有 1 个输入，就取那唯一输入；若源交易输入数足够覆盖当前 `source_output_index`，就取同索引输入；否则判定为 `DAO_DEPOSIT_REFERENCE_AMBIGUOUS`。
+- 源输出 `data` 必须是**恰好 8 字节**，并按 little-endian 解码：
+  - 若解码结果为 `0`：按 DAO 第一阶段提现处理，当前实现要求同输入索引位置存在 DAO withdrawing output，且其容量等于原始 deposit 容量、输出 data 记录源交易所在块高；这类输入按**原始 deposit 容量**计入 `dao_effective_sum`，不会调用 `calculate_dao_maximum_withdraw(...)`。
+  - 若解码结果大于 `0`：按 DAO 最终提现处理，当前实现从该 withdrawing cell 的**源交易同索引输入**追溯 deposit out point，并从当前交易 `witness.input_type` 指向的 `header_dep` 校验 deposit 块高；校验通过后，再调用 `calculate_dao_maximum_withdraw(...)` 计算这笔输入的最大可提容量。
 - 比较公式：`ordinary_output_sum <= ordinary_input_sum + dao_effective_sum`，单位 shannon。
   - 其中 `ordinary_input_sum` 是同交易里所有**已解析且非 DAO**输入来源输出容量之和；
   - `ordinary_output_sum` 按当前实现仍是**该交易全部输出容量之和**。
-- 代表性失败：`INPUT_TX_OUTPUT_DATA_MISSING`、`DAO_WITHDRAW_HEADER_MISSING`、`DAO_DEPOSIT_REFERENCE_AMBIGUOUS`、`DAO_WITHDRAW_CAPACITY_EXCEEDED`。
-- 常见未完成原因：`DAO_MAXIMUM_WITHDRAW_MISSING`、`DAO_MAXIMUM_WITHDRAW_RPC_ERROR`、`DAO_WITHDRAW_CAPACITY_INCOMPLETE`、`DAO_CLASSIFICATION_UNKNOWN`。
+- 代表性失败：`DAO_INPUT_DATA_INVALID`、`DAO_WITHDRAWING_OUTPUT_CAPACITY_MISMATCH`、`DAO_DEPOSIT_HEADER_BLOCK_NUMBER_MISMATCH`、`DAO_WITHDRAW_CAPACITY_EXCEEDED`。
+- 常见未完成原因：`DAO_MAXIMUM_WITHDRAW_MISSING`、`DAO_MAXIMUM_WITHDRAW_RPC_ERROR`、`DAO_DEPOSIT_HEADER_MISSING`、`DAO_WITHDRAW_CAPACITY_INCOMPLETE`、`DAO_CLASSIFICATION_UNKNOWN`。
 
 ---
 
