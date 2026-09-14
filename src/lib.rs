@@ -169,12 +169,11 @@ pub enum CheckStatus {
     Fail,
     Unknown,
     NotApplicable,
-    NotImplemented,
 }
 
 impl CheckStatus {
     fn is_omitted(&self) -> bool {
-        matches!(self, Self::NotApplicable | Self::NotImplemented)
+        matches!(self, Self::NotApplicable)
     }
 }
 
@@ -233,7 +232,9 @@ struct ConsensusSnapshot {
     genesis_hash: H256,
     dao_type_hash: H256,
     max_block_bytes: usize,
+    max_uncles_num: usize,
     proposal_limit: usize,
+    block_version: u32,
     tx_version: u32,
     median_time_block_count: usize,
     finalization_delay_length: u64,
@@ -258,8 +259,11 @@ impl ConsensusSnapshot {
             dao_type_hash: consensus.dao_type_hash,
             max_block_bytes: usize::try_from(consensus.max_block_bytes.value())
                 .context("consensus max_block_bytes exceeds platform usize")?,
+            max_uncles_num: usize::try_from(consensus.max_uncles_num.value())
+                .context("consensus max_uncles_num exceeds platform usize")?,
             proposal_limit: usize::try_from(consensus.max_block_proposals_limit.value())
                 .context("consensus max_block_proposals_limit exceeds platform usize")?,
+            block_version: consensus.block_version.value(),
             tx_version: consensus.tx_version.value(),
             median_time_block_count: usize::try_from(consensus.median_time_block_count.value())
                 .context("consensus median_time_block_count exceeds platform usize")?,
@@ -313,7 +317,11 @@ pub struct AuditLog {
     #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_timestamp: CheckStatus,
     #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
+    pub check_block_version: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_block_size: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
+    pub check_uncle_count_limit: CheckStatus,
     #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_proposal_limit: CheckStatus,
     #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
@@ -357,8 +365,6 @@ pub struct AuditLog {
     pub check_occupied_capacity: CheckStatus,
     #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_ordinary_capacity_conservation: CheckStatus,
-    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
-    pub check_input_historical_liveness: CheckStatus,
 
     #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_cellbase_reward_amount: CheckStatus,
@@ -366,23 +372,6 @@ pub struct AuditLog {
     pub check_cellbase_reward_target: CheckStatus,
     #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_dao_withdraw_capacity: CheckStatus,
-
-    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
-    pub check_pow: CheckStatus,
-    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
-    pub check_expected_epoch_target: CheckStatus,
-    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
-    pub check_two_phase_commit: CheckStatus,
-    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
-    pub check_cellbase_maturity: CheckStatus,
-    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
-    pub check_since: CheckStatus,
-    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
-    pub check_extension_consensus_rules: CheckStatus,
-    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
-    pub check_vm_scripts: CheckStatus,
-    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
-    pub check_cycles: CheckStatus,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed_checks: Option<Vec<String>>,
@@ -414,7 +403,9 @@ impl AuditLog {
             check_parent_hash: CheckStatus::Unknown,
             check_epoch_continuity: CheckStatus::Unknown,
             check_timestamp: CheckStatus::Unknown,
+            check_block_version: CheckStatus::Unknown,
             check_block_size: CheckStatus::Unknown,
+            check_uncle_count_limit: CheckStatus::Unknown,
             check_proposal_limit: CheckStatus::Unknown,
             check_block_hash: CheckStatus::Unknown,
             check_transaction_hashes: CheckStatus::Unknown,
@@ -428,7 +419,7 @@ impl AuditLog {
             check_transaction_version: CheckStatus::Unknown,
             check_inputs_outputs_structure: CheckStatus::Unknown,
             check_outputs_data_length: CheckStatus::Unknown,
-            check_output_lock_hash_type: CheckStatus::NotImplemented,
+            check_output_lock_hash_type: CheckStatus::NotApplicable,
             check_duplicate_cell_deps: CheckStatus::Unknown,
             check_duplicate_header_deps: CheckStatus::Unknown,
             check_duplicate_inputs_in_transaction: CheckStatus::Unknown,
@@ -437,20 +428,10 @@ impl AuditLog {
             check_input_output_index: CheckStatus::NotApplicable,
             check_occupied_capacity: CheckStatus::NotApplicable,
             check_ordinary_capacity_conservation: CheckStatus::NotApplicable,
-            check_input_historical_liveness: CheckStatus::NotImplemented,
 
             check_cellbase_reward_amount: CheckStatus::Unknown,
             check_cellbase_reward_target: CheckStatus::Unknown,
             check_dao_withdraw_capacity: CheckStatus::NotApplicable,
-
-            check_pow: CheckStatus::NotImplemented,
-            check_expected_epoch_target: CheckStatus::NotImplemented,
-            check_two_phase_commit: CheckStatus::NotImplemented,
-            check_cellbase_maturity: CheckStatus::NotImplemented,
-            check_since: CheckStatus::NotImplemented,
-            check_extension_consensus_rules: CheckStatus::NotImplemented,
-            check_vm_scripts: CheckStatus::NotImplemented,
-            check_cycles: CheckStatus::NotImplemented,
 
             failed_checks: None,
             details_truncated: None,
@@ -476,7 +457,9 @@ impl AuditLog {
             ("check_parent_hash", self.check_parent_hash),
             ("check_epoch_continuity", self.check_epoch_continuity),
             ("check_timestamp", self.check_timestamp),
+            ("check_block_version", self.check_block_version),
             ("check_block_size", self.check_block_size),
+            ("check_uncle_count_limit", self.check_uncle_count_limit),
             ("check_proposal_limit", self.check_proposal_limit),
             ("check_block_hash", self.check_block_hash),
             ("check_transaction_hashes", self.check_transaction_hashes),
@@ -523,10 +506,6 @@ impl AuditLog {
                 self.check_ordinary_capacity_conservation,
             ),
             (
-                "check_input_historical_liveness",
-                self.check_input_historical_liveness,
-            ),
-            (
                 "check_cellbase_reward_amount",
                 self.check_cellbase_reward_amount,
             ),
@@ -538,20 +517,6 @@ impl AuditLog {
                 "check_dao_withdraw_capacity",
                 self.check_dao_withdraw_capacity,
             ),
-            ("check_pow", self.check_pow),
-            (
-                "check_expected_epoch_target",
-                self.check_expected_epoch_target,
-            ),
-            ("check_two_phase_commit", self.check_two_phase_commit),
-            ("check_cellbase_maturity", self.check_cellbase_maturity),
-            ("check_since", self.check_since),
-            (
-                "check_extension_consensus_rules",
-                self.check_extension_consensus_rules,
-            ),
-            ("check_vm_scripts", self.check_vm_scripts),
-            ("check_cycles", self.check_cycles),
         ];
 
         let mut failed_checks: Vec<String> = checks
@@ -641,7 +606,9 @@ impl AuditLog {
             ("check_parent_hash", self.check_parent_hash),
             ("check_epoch_continuity", self.check_epoch_continuity),
             ("check_timestamp", self.check_timestamp),
+            ("check_block_version", self.check_block_version),
             ("check_block_size", self.check_block_size),
+            ("check_uncle_count_limit", self.check_uncle_count_limit),
             ("check_proposal_limit", self.check_proposal_limit),
             ("check_block_hash", self.check_block_hash),
             ("check_transaction_hashes", self.check_transaction_hashes),
@@ -688,10 +655,6 @@ impl AuditLog {
                 self.check_ordinary_capacity_conservation,
             ),
             (
-                "check_input_historical_liveness",
-                self.check_input_historical_liveness,
-            ),
-            (
                 "check_cellbase_reward_amount",
                 self.check_cellbase_reward_amount,
             ),
@@ -703,20 +666,6 @@ impl AuditLog {
                 "check_dao_withdraw_capacity",
                 self.check_dao_withdraw_capacity,
             ),
-            ("check_pow", self.check_pow),
-            (
-                "check_expected_epoch_target",
-                self.check_expected_epoch_target,
-            ),
-            ("check_two_phase_commit", self.check_two_phase_commit),
-            ("check_cellbase_maturity", self.check_cellbase_maturity),
-            ("check_since", self.check_since),
-            (
-                "check_extension_consensus_rules",
-                self.check_extension_consensus_rules,
-            ),
-            ("check_vm_scripts", self.check_vm_scripts),
-            ("check_cycles", self.check_cycles),
         ]
     }
 
@@ -726,7 +675,9 @@ impl AuditLog {
             &mut self.check_parent_hash,
             &mut self.check_epoch_continuity,
             &mut self.check_timestamp,
+            &mut self.check_block_version,
             &mut self.check_block_size,
+            &mut self.check_uncle_count_limit,
             &mut self.check_proposal_limit,
             &mut self.check_block_hash,
             &mut self.check_transaction_hashes,
@@ -748,18 +699,9 @@ impl AuditLog {
             &mut self.check_input_output_index,
             &mut self.check_occupied_capacity,
             &mut self.check_ordinary_capacity_conservation,
-            &mut self.check_input_historical_liveness,
             &mut self.check_cellbase_reward_amount,
             &mut self.check_cellbase_reward_target,
             &mut self.check_dao_withdraw_capacity,
-            &mut self.check_pow,
-            &mut self.check_expected_epoch_target,
-            &mut self.check_two_phase_commit,
-            &mut self.check_cellbase_maturity,
-            &mut self.check_since,
-            &mut self.check_extension_consensus_rules,
-            &mut self.check_vm_scripts,
-            &mut self.check_cycles,
         ] {
             if *status == CheckStatus::Unknown {
                 *status = CheckStatus::Fail;
@@ -1272,7 +1214,9 @@ impl<R: CkbRpc> Auditor<R> {
             ("check_parent_hash", log.check_parent_hash),
             ("check_epoch_continuity", log.check_epoch_continuity),
             ("check_timestamp", log.check_timestamp),
+            ("check_block_version", log.check_block_version),
             ("check_block_size", log.check_block_size),
+            ("check_uncle_count_limit", log.check_uncle_count_limit),
             ("check_proposal_limit", log.check_proposal_limit),
             ("check_block_hash", log.check_block_hash),
             ("check_transaction_hashes", log.check_transaction_hashes),
@@ -1410,7 +1354,9 @@ impl<R: CkbRpc> Auditor<R> {
         let reason = format!("get_consensus unavailable: {err}");
         for check_name in [
             "check_timestamp",
+            "check_block_version",
             "check_block_size",
+            "check_uncle_count_limit",
             "check_proposal_limit",
             "check_transaction_version",
             "check_ordinary_capacity_conservation",
@@ -1723,6 +1669,64 @@ impl<R: CkbRpc> Auditor<R> {
         let block_data: packed::Block = core_block.data();
         let actual_block_size = block_data.serialized_size_without_uncle_proposals();
         if let Some(consensus) = consensus {
+            let actual_block_version = block.header.inner.version.value();
+            log.check_block_version = if actual_block_version == consensus.block_version {
+                CheckStatus::Pass
+            } else {
+                log.push_detail(
+                    &self.config,
+                    DetailItem {
+                        check_name: "check_block_version".to_string(),
+                        status: CheckStatus::Fail,
+                        error_code: "BLOCK_VERSION_MISMATCH".to_string(),
+                        failure_kind: None,
+                        rpc_method: None,
+                        attempts: None,
+                        max_retries: None,
+                        tx_hash: None,
+                        tx_index: None,
+                        input_index: None,
+                        output_index: None,
+                        referenced_out_point: None,
+                        expected_operator: Some("equal".to_string()),
+                        expected_value: Some(consensus.block_version.to_string()),
+                        actual_value: Some(actual_block_version.to_string()),
+                        unit: Some("version".to_string()),
+                        reason: "block version does not match the consensus block_version"
+                            .to_string(),
+                    },
+                );
+                CheckStatus::Fail
+            };
+            let actual_uncle_count = block.uncles.len();
+            log.check_uncle_count_limit = if actual_uncle_count <= consensus.max_uncles_num {
+                CheckStatus::Pass
+            } else {
+                log.push_detail(
+                    &self.config,
+                    DetailItem {
+                        check_name: "check_uncle_count_limit".to_string(),
+                        status: CheckStatus::Fail,
+                        error_code: "UNCLE_COUNT_EXCEEDED".to_string(),
+                        failure_kind: None,
+                        rpc_method: None,
+                        attempts: None,
+                        max_retries: None,
+                        tx_hash: None,
+                        tx_index: None,
+                        input_index: None,
+                        output_index: None,
+                        referenced_out_point: None,
+                        expected_operator: Some("less_than_or_equal".to_string()),
+                        expected_value: Some(consensus.max_uncles_num.to_string()),
+                        actual_value: Some(actual_uncle_count.to_string()),
+                        unit: Some("uncle".to_string()),
+                        reason: "uncle count exceeds the consensus max_uncles_num limit"
+                            .to_string(),
+                    },
+                );
+                CheckStatus::Fail
+            };
             log.check_block_size = if actual_block_size <= consensus.max_block_bytes {
                 CheckStatus::Pass
             } else {
@@ -1780,7 +1784,9 @@ impl<R: CkbRpc> Auditor<R> {
                 CheckStatus::Fail
             };
         } else {
+            log.check_block_version = CheckStatus::Unknown;
             log.check_block_size = CheckStatus::Unknown;
+            log.check_uncle_count_limit = CheckStatus::Unknown;
             log.check_proposal_limit = CheckStatus::Unknown;
         };
 
@@ -2541,7 +2547,7 @@ impl<R: CkbRpc> Auditor<R> {
         let mut overall_tx_version = CheckStatus::NotApplicable;
         let mut overall_struct = CheckStatus::NotApplicable;
         let mut overall_data_len = CheckStatus::NotApplicable;
-        let overall_lock_hash_type = CheckStatus::NotImplemented;
+        let mut overall_lock_hash_type = CheckStatus::NotApplicable;
         let mut overall_dup_cell_dep = CheckStatus::NotApplicable;
         let mut overall_dup_header_dep = CheckStatus::NotApplicable;
         let mut overall_dup_input_tx = CheckStatus::NotApplicable;
@@ -2564,6 +2570,7 @@ impl<R: CkbRpc> Auditor<R> {
             overall_tx_version = merge_status(overall_tx_version, CheckStatus::Pass);
             overall_struct = merge_status(overall_struct, CheckStatus::Pass);
             overall_data_len = merge_status(overall_data_len, CheckStatus::Pass);
+            overall_lock_hash_type = merge_status(overall_lock_hash_type, CheckStatus::Pass);
             overall_dup_cell_dep = merge_status(overall_dup_cell_dep, CheckStatus::Pass);
             overall_dup_header_dep = merge_status(overall_dup_header_dep, CheckStatus::Pass);
             overall_dup_input_tx = merge_status(overall_dup_input_tx, CheckStatus::Pass);
@@ -2803,6 +2810,39 @@ impl<R: CkbRpc> Auditor<R> {
             let mut dao_effective_sum: u128 = 0;
 
             for (output_index, output) in tx.inner.outputs.iter().enumerate() {
+                let lock_hash_type_raw: u8 = packed::CellOutput::from(output.clone())
+                    .lock()
+                    .hash_type()
+                    .into();
+                if !ckb_types::core::ScriptHashType::verify_value(lock_hash_type_raw) {
+                    overall_lock_hash_type =
+                        merge_status(overall_lock_hash_type, CheckStatus::Fail);
+                    log.push_detail(
+                        &self.config,
+                        DetailItem {
+                            check_name: "check_output_lock_hash_type".to_string(),
+                            status: CheckStatus::Fail,
+                            error_code: "OUTPUT_LOCK_HASH_TYPE_INVALID".to_string(),
+                            failure_kind: None,
+                            rpc_method: None,
+                            attempts: None,
+                            max_retries: None,
+                            tx_hash: Some(format!("{:#x}", tx.hash)),
+                            tx_index: Some(tx_index),
+                            input_index: None,
+                            output_index: Some(output_index),
+                            referenced_out_point: None,
+                            expected_operator: Some("valid_encoding".to_string()),
+                            expected_value: Some(
+                                "0x01 or any even byte in [0x00,0xfe]".to_string(),
+                            ),
+                            actual_value: Some(format!("0x{lock_hash_type_raw:02x}")),
+                            unit: Some("hash_type".to_string()),
+                            reason: "output lock script hash_type encoding is not allowed by CKB consensus"
+                                .to_string(),
+                        },
+                    );
+                }
                 ordinary_output_sum = match ordinary_output_sum
                     .checked_add(output.capacity.value() as u128)
                 {
@@ -3620,7 +3660,6 @@ fn merge_status(old: CheckStatus, new_status: CheckStatus) -> CheckStatus {
         Unknown => 3,
         Pass => 2,
         NotApplicable => 1,
-        NotImplemented => 0,
     };
     if rank(new_status) > rank(old) {
         new_status
@@ -4136,6 +4175,14 @@ mod tests {
         byte: u8,
         hash_type: ckb_types::core::ScriptHashType,
     ) -> ckb_types::packed::Script {
+        ckb_types::packed::Script::new_builder()
+            .code_hash(Byte32::new([byte; 32]))
+            .hash_type(hash_type)
+            .args(ckb_types::bytes::Bytes::new())
+            .build()
+    }
+
+    fn lock_script_with_raw_hash_type(byte: u8, hash_type: u8) -> ckb_types::packed::Script {
         ckb_types::packed::Script::new_builder()
             .code_hash(Byte32::new([byte; 32]))
             .hash_type(hash_type)
@@ -4681,6 +4728,42 @@ mod tests {
             json!([format!("{hash:#x}"), "0x2", true])
         );
         assert_eq!(response.tx_status.status, Status::Committed);
+    }
+
+    #[tokio::test]
+    async fn test_http_get_block_by_number_rejects_invalid_lock_hash_type_from_wire() {
+        let block = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(1u64)
+                    .epoch(EpochNumberWithFraction::new(0, 1, 1000).full_value())
+                    .build(),
+            )
+            .transaction(
+                TransactionBuilder::default()
+                    .version(0u32)
+                    .input(CellInput::new_cellbase_input(1))
+                    .output(simple_cell_output(100))
+                    .output_data(ckb_types::bytes::Bytes::new())
+                    .witness(simple_lock_script().into_witness())
+                    .build(),
+            )
+            .build();
+        let mut block_value = serde_json::to_value(BlockView::from(block)).unwrap();
+        block_value["transactions"][0]["outputs"][0]["lock"]["hash_type"] = json!("data255");
+        let response_body = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": block_value,
+        }))
+        .unwrap();
+        let (url, _body, handle) = serve_http_once("200 OK", response_body);
+        let rpc = HttpRpc::new(url, 5, 0).unwrap();
+
+        let err = rpc.get_block_by_number(1).await.unwrap_err().to_string();
+        handle.join().unwrap();
+
+        assert!(err.contains("rpc get_block_by_number result decode failed"));
     }
 
     #[tokio::test]
@@ -5303,7 +5386,7 @@ mod tests {
     }
 
     #[test]
-    fn test_serialization_omits_not_implemented_and_not_applicable_checks() {
+    fn test_serialization_omits_not_applicable_checks() {
         let block = BlockBuilder::default()
             .header(HeaderBuilder::default().number(0u64).build())
             .build();
@@ -5317,15 +5400,82 @@ mod tests {
         assert_eq!(value["schema_version"], 4);
         assert!(value.get("check_block_height").is_some());
         assert!(value.get("check_cellbase_reward_amount").is_some());
-        assert!(value.get("check_pow").is_none());
         assert!(value.get("check_dao_withdraw_capacity").is_none());
-        assert!(value.get("check_output_lock_hash_type").is_none());
         assert!(value.get("network").is_none());
         assert!(value.get("reward_target_block_hash").is_none());
         assert!(value.get("reward_verification_method").is_none());
         assert!(value.get("coverage").is_none());
         assert!(value.get("unknown_checks").is_none());
         assert_eq!(value["result"], "FAIL");
+    }
+
+    #[tokio::test]
+    async fn test_output_lock_hash_type_accepts_all_consensus_encodings() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path().join("cursor.json"));
+        let parent = HeaderBuilder::default()
+            .number(1u64)
+            .timestamp(1000u64)
+            .epoch(EpochNumberWithFraction::new(0, 1, 1000).full_value())
+            .build();
+        let prev_tx = TransactionBuilder::default()
+            .version(0u32)
+            .output(simple_cell_output(2_000_000_000_000))
+            .output_data(ckb_types::bytes::Bytes::new())
+            .build();
+        let mut spend_builder = TransactionBuilder::default()
+            .version(0u32)
+            .input(CellInput::new(PackedOutPoint::new(prev_tx.hash(), 0), 0));
+        spend_builder = spend_builder
+            .output(
+                CellOutput::new_builder()
+                    .capacity(10_000_000_000u64)
+                    .lock(lock_script_with_raw_hash_type(0, 1))
+                    .type_(ScriptOpt::default())
+                    .build(),
+            )
+            .output_data(ckb_types::bytes::Bytes::new());
+        for hash_type in 0u8..=254 {
+            if !ckb_types::core::ScriptHashType::verify_value(hash_type) || hash_type == 1 {
+                continue;
+            }
+            spend_builder = spend_builder
+                .output(
+                    CellOutput::new_builder()
+                        .capacity(10_000_000_000u64)
+                        .lock(lock_script_with_raw_hash_type(hash_type, hash_type))
+                        .type_(ScriptOpt::default())
+                        .build(),
+                )
+                .output_data(ckb_types::bytes::Bytes::new());
+        }
+        let spend_tx = spend_builder.build();
+        let block = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(2u64)
+                    .timestamp(1200u64)
+                    .epoch(EpochNumberWithFraction::new(0, 2, 1000).full_value())
+                    .parent_hash(parent.hash())
+                    .build(),
+            )
+            .transaction(empty_cellbase(2))
+            .transaction(spend_tx)
+            .build();
+        let block_json: BlockView = block.clone().into();
+        let core_block: CoreBlockView = block.clone();
+        let mut log = AuditLog::new(&cfg, &block_json);
+        let rpc = Arc::new(MockRpc::default());
+        rpc.txs.lock().unwrap().insert(
+            format!("{:#x}", prev_tx.hash()),
+            serde_json::to_value(committed_tx_response(&prev_tx, parent.hash().unpack())).unwrap(),
+        );
+        let auditor = Auditor::new(rpc, cfg);
+        let consensus = ConsensusSnapshot::from_rpc(&auditor.config, mock_consensus()).unwrap();
+        auditor
+            .audit_transactions(&block_json, &core_block, &mut log, Some(&consensus))
+            .await;
+        assert_eq!(log.check_output_lock_hash_type, CheckStatus::Pass);
     }
 
     #[tokio::test]
@@ -5431,5 +5581,129 @@ mod tests {
             )
             .await;
         assert_eq!(fail_log.check_block_size, CheckStatus::Fail);
+    }
+
+    #[tokio::test]
+    async fn test_block_version_and_uncle_limit_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path().join("cursor.json"));
+        let block = BlockBuilder::default()
+            .header(HeaderBuilder::default().number(0u64).version(0u32).build())
+            .transaction(empty_cellbase(0))
+            .build();
+        let block_json: BlockView = block.clone().into();
+        let core_block: CoreBlockView = block.clone();
+        let rpc = Arc::new(MockRpc::default());
+        let auditor = Auditor::new(rpc, cfg.clone());
+
+        let mut pass_consensus_value =
+            serde_json::to_value(mock_consensus_with_limit(10_000_000)).unwrap();
+        pass_consensus_value["max_uncles_num"] = json!("0x0");
+        pass_consensus_value["block_version"] = json!("0x0");
+        let pass_consensus = ConsensusSnapshot::from_rpc(
+            &cfg,
+            serde_json::from_value(pass_consensus_value).unwrap(),
+        )
+        .unwrap();
+        let mut pass_log = AuditLog::new(&cfg, &block_json);
+        auditor
+            .audit_header_and_block(
+                &block_json,
+                &core_block,
+                &mut pass_log,
+                Some(&pass_consensus),
+            )
+            .await;
+        assert_eq!(pass_log.check_block_version, CheckStatus::Pass);
+        assert_eq!(pass_log.check_uncle_count_limit, CheckStatus::Pass);
+
+        let mut block_version_fail_value =
+            serde_json::to_value(mock_consensus_with_limit(10_000_000)).unwrap();
+        block_version_fail_value["max_uncles_num"] = json!("0x0");
+        block_version_fail_value["block_version"] = json!("0x1");
+        let block_version_fail_consensus = ConsensusSnapshot::from_rpc(
+            &cfg,
+            serde_json::from_value(block_version_fail_value).unwrap(),
+        )
+        .unwrap();
+        let mut block_version_fail_log = AuditLog::new(&cfg, &block_json);
+        auditor
+            .audit_header_and_block(
+                &block_json,
+                &core_block,
+                &mut block_version_fail_log,
+                Some(&block_version_fail_consensus),
+            )
+            .await;
+        assert_eq!(
+            block_version_fail_log.check_block_version,
+            CheckStatus::Fail
+        );
+        assert!(
+            block_version_fail_log
+                .details
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|detail| detail.error_code == "BLOCK_VERSION_MISMATCH")
+        );
+
+        let uncle_source = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(7u64)
+                    .epoch(EpochNumberWithFraction::new(0, 7, 1000).full_value())
+                    .build(),
+            )
+            .build();
+        let block_with_uncle = BlockBuilder::default()
+            .header(HeaderBuilder::default().number(0u64).version(0u32).build())
+            .uncle(uncle_source.as_uncle())
+            .transaction(empty_cellbase(0))
+            .build();
+        let block_with_uncle_json: BlockView = block_with_uncle.clone().into();
+        let block_with_uncle_core: CoreBlockView = block_with_uncle.clone();
+
+        let mut equal_limit_value =
+            serde_json::to_value(mock_consensus_with_limit(10_000_000)).unwrap();
+        equal_limit_value["max_uncles_num"] = json!("0x1");
+        let equal_limit_consensus =
+            ConsensusSnapshot::from_rpc(&cfg, serde_json::from_value(equal_limit_value).unwrap())
+                .unwrap();
+        let mut equal_limit_log = AuditLog::new(&cfg, &block_with_uncle_json);
+        auditor
+            .audit_header_and_block(
+                &block_with_uncle_json,
+                &block_with_uncle_core,
+                &mut equal_limit_log,
+                Some(&equal_limit_consensus),
+            )
+            .await;
+        assert_eq!(equal_limit_log.check_uncle_count_limit, CheckStatus::Pass);
+
+        let mut uncle_fail_value =
+            serde_json::to_value(mock_consensus_with_limit(10_000_000)).unwrap();
+        uncle_fail_value["max_uncles_num"] = json!("0x0");
+        let uncle_fail_consensus =
+            ConsensusSnapshot::from_rpc(&cfg, serde_json::from_value(uncle_fail_value).unwrap())
+                .unwrap();
+        let mut uncle_fail_log = AuditLog::new(&cfg, &block_with_uncle_json);
+        auditor
+            .audit_header_and_block(
+                &block_with_uncle_json,
+                &block_with_uncle_core,
+                &mut uncle_fail_log,
+                Some(&uncle_fail_consensus),
+            )
+            .await;
+        assert_eq!(uncle_fail_log.check_uncle_count_limit, CheckStatus::Fail);
+        assert!(
+            uncle_fail_log
+                .details
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|detail| detail.error_code == "UNCLE_COUNT_EXCEEDED")
+        );
     }
 }
