@@ -960,10 +960,7 @@ impl HttpRpc {
                 match state.deadline {
                     Some(deadline) if deadline > self.clock.now() => Some(deadline),
                     Some(_) => {
-                        let resume_at = state
-                            .resume_at_utc
-                            .take()
-                            .unwrap_or_else(|| Utc::now());
+                        let resume_at = state.resume_at_utc.take().unwrap_or_else(Utc::now);
                         let method = state.method.take().unwrap_or_else(|| "unknown".to_string());
                         let reason = state.reason.take().unwrap_or_default();
                         state.deadline = None;
@@ -1013,12 +1010,7 @@ impl HttpRpc {
             .unwrap_or_else(|| std::time::Duration::from_secs(RATE_LIMIT_FALLBACK_DELAY_SECS))
     }
 
-    fn record_cooldown(
-        &self,
-        method: &str,
-        delay: std::time::Duration,
-        reason: &str,
-    ) {
+    fn record_cooldown(&self, method: &str, delay: std::time::Duration, reason: &str) {
         let now = self.clock.now();
         let new_deadline = now + delay;
         let resume_at_utc = chrono::Duration::from_std(delay)
@@ -1413,9 +1405,7 @@ impl<R: CkbRpc> Auditor<R> {
                     .then(|| state.next_hash.clone())
                     .flatten()
             });
-            let Some(outcome) =
-                self.audit_height_with_retries(height, &consensus).await?
-            else {
+            let Some(outcome) = self.audit_height_with_retries(height, &consensus).await? else {
                 break;
             };
             let (block, log, completed, block_attempt, total_block_attempts) = match outcome {
@@ -1425,7 +1415,13 @@ impl<R: CkbRpc> Auditor<R> {
                     log,
                     block_attempt,
                     total_block_attempts,
-                } => (block, log, false, Some(block_attempt), Some(total_block_attempts)),
+                } => (
+                    block,
+                    log,
+                    false,
+                    Some(block_attempt),
+                    Some(total_block_attempts),
+                ),
             };
             let hash = format!("{:#x}", block.header.hash);
             if pending_hash
@@ -4112,10 +4108,7 @@ fn format_http_status_error(
     )
 }
 
-fn parse_retry_after_value(
-    value: &str,
-    now: DateTime<Utc>,
-) -> Option<std::time::Duration> {
+fn parse_retry_after_value(value: &str, now: DateTime<Utc>) -> Option<std::time::Duration> {
     let trimmed = value.trim();
     if let Ok(seconds) = trimmed.parse::<u64>() {
         return Some(std::time::Duration::from_secs(seconds));
@@ -4281,8 +4274,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use tokio::sync::Notify;
 
@@ -4789,11 +4782,7 @@ mod tests {
 
     fn serve_http_sequence(
         responses: Vec<TestHttpResponse>,
-    ) -> (
-        String,
-        Arc<AtomicUsize>,
-        thread::JoinHandle<()>,
-    ) {
+    ) -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let request_count = Arc::new(AtomicUsize::new(0));
@@ -4829,7 +4818,11 @@ mod tests {
                 stream.write_all(wire_response.as_bytes()).unwrap();
             }
         });
-        (format!("http://127.0.0.1:{}", addr.port()), request_count, handle)
+        (
+            format!("http://127.0.0.1:{}", addr.port()),
+            request_count,
+            handle,
+        )
     }
 
     fn read_log_lines(path: &Path) -> Vec<serde_json::Value> {
@@ -5460,7 +5453,11 @@ mod tests {
         .unwrap();
         rpc.record_cooldown("get_consensus", std::time::Duration::from_secs(60), "first");
         clock.advance(std::time::Duration::from_secs(60));
-        rpc.record_cooldown("get_tip_header", std::time::Duration::from_secs(120), "second");
+        rpc.record_cooldown(
+            "get_tip_header",
+            std::time::Duration::from_secs(120),
+            "second",
+        );
         let remaining = rpc
             .current_cooldown_deadline()
             .unwrap()
@@ -6169,7 +6166,11 @@ mod tests {
 
         let auditor = Auditor::new(rpc.clone(), cfg.clone());
         let mut cursor = None;
-        let err = auditor.poll_once(&mut cursor).await.unwrap_err().to_string();
+        let err = auditor
+            .poll_once(&mut cursor)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("failed to replace cursor file"));
         let lines = read_log_lines(&log_path);
         assert_eq!(lines.len(), 1);
@@ -6236,7 +6237,10 @@ mod tests {
             .lock()
             .unwrap()
             .insert(format!("{:#x}", parent_json.hash), parent_json.clone());
-        rpc.headers_by_number.lock().unwrap().insert(1, parent_json.clone());
+        rpc.headers_by_number
+            .lock()
+            .unwrap()
+            .insert(1, parent_json.clone());
         rpc.headers_by_number
             .lock()
             .unwrap()
