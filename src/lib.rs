@@ -22,6 +22,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+const RETRY_BASE_DELAY_MS: u64 = 100;
+
 #[derive(Debug, Clone)]
 pub struct AuditorConfig {
     pub rpc_url: String,
@@ -46,6 +48,10 @@ pub struct CursorState {
     pub genesis_hash: Option<String>,
     pub last_height: u64,
     pub last_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_height: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_hash: Option<String>,
     #[serde(default)]
     pub history: BTreeMap<u64, String>,
 }
@@ -90,19 +96,67 @@ impl CursorState {
             genesis_hash: Some(genesis_hash),
             last_height: height,
             last_hash: hash.clone(),
+            next_height: None,
+            next_hash: None,
             history: BTreeMap::new(),
         };
         state.push_block(height, hash, retention);
         state
     }
 
+    fn new_pending(genesis_hash: String, block: &BlockView, retention: usize) -> Self {
+        let height = block.header.inner.number.value();
+        let hash = format!("{:#x}", block.header.hash);
+        let mut state = Self {
+            genesis_hash: Some(genesis_hash),
+            last_height: height.saturating_sub(1),
+            last_hash: if height == 0 {
+                String::new()
+            } else {
+                format!("{:#x}", block.header.inner.parent_hash)
+            },
+            next_height: None,
+            next_hash: None,
+            history: BTreeMap::new(),
+        };
+        if height > 0 {
+            state.push_block(
+                height - 1,
+                format!("{:#x}", block.header.inner.parent_hash),
+                retention,
+            );
+        }
+        state.next_height = Some(height);
+        state.next_hash = Some(hash);
+        state
+    }
+
     fn push_block(&mut self, height: u64, hash: String, retention: usize) {
         self.last_height = height;
         self.last_hash = hash.clone();
+        self.next_height = None;
+        self.next_hash = None;
         self.history.insert(height, hash);
         while self.history.len() > retention {
             if let Some(key) = self.history.keys().next().copied() {
                 self.history.remove(&key);
+            }
+        }
+    }
+
+    fn mark_pending(&mut self, block: &BlockView, retention: usize) {
+        let height = block.header.inner.number.value();
+        self.next_height = Some(height);
+        self.next_hash = Some(format!("{:#x}", block.header.hash));
+        if height > 0 {
+            self.last_height = height - 1;
+            self.last_hash = format!("{:#x}", block.header.inner.parent_hash);
+            self.history
+                .insert(self.last_height, self.last_hash.clone());
+            while self.history.len() > retention {
+                if let Some(key) = self.history.keys().next().copied() {
+                    self.history.remove(&key);
+                }
             }
         }
     }
@@ -128,8 +182,15 @@ impl CheckStatus {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AuditResult {
     Fail,
-    Incomplete,
-    PassWithinScope,
+    Pass,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FailureKind {
+    ValidationFailed,
+    RetryExhausted,
+    ExecutionFailed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,15 +198,31 @@ pub struct DetailItem {
     pub check_name: String,
     pub status: CheckStatus,
     pub error_code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<FailureKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpc_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub input_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_index: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub referenced_out_point: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_operator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub actual_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
     pub reason: String,
 }
@@ -225,7 +302,6 @@ pub struct AuditLog {
     pub canonical_at_audit: bool,
 
     pub result: AuditResult,
-    pub coverage: String,
     pub audit_duration_ms: u64,
 
     #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
@@ -311,8 +387,6 @@ pub struct AuditLog {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed_checks: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub unknown_checks: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub details_truncated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details_total: Option<usize>,
@@ -324,7 +398,7 @@ impl AuditLog {
     fn new(config: &AuditorConfig, block: &BlockView) -> Self {
         Self {
             timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-            schema_version: 3,
+            schema_version: 4,
             service: "ckb-block-auditor".to_string(),
             auditor_version: env!("CARGO_PKG_VERSION").to_string(),
             node_id: config.node_id.clone(),
@@ -333,8 +407,7 @@ impl AuditLog {
             parent_hash: format!("{:#x}", block.header.inner.parent_hash),
             block_timestamp: block.header.inner.timestamp.value(),
             canonical_at_audit: true,
-            result: AuditResult::Incomplete,
-            coverage: "PARTIAL".to_string(),
+            result: AuditResult::Fail,
             audit_duration_ms: 0,
 
             check_block_height: CheckStatus::Unknown,
@@ -355,7 +428,7 @@ impl AuditLog {
             check_transaction_version: CheckStatus::Unknown,
             check_inputs_outputs_structure: CheckStatus::Unknown,
             check_outputs_data_length: CheckStatus::Unknown,
-            check_output_lock_hash_type: CheckStatus::Unknown,
+            check_output_lock_hash_type: CheckStatus::NotImplemented,
             check_duplicate_cell_deps: CheckStatus::Unknown,
             check_duplicate_header_deps: CheckStatus::Unknown,
             check_duplicate_inputs_in_transaction: CheckStatus::Unknown,
@@ -380,7 +453,6 @@ impl AuditLog {
             check_cycles: CheckStatus::NotImplemented,
 
             failed_checks: None,
-            unknown_checks: None,
             details_truncated: None,
             details_total: None,
             details: None,
@@ -398,7 +470,7 @@ impl AuditLog {
         }
     }
 
-    fn finalize(&mut self) {
+    fn finalize(&mut self, attempts: u32, max_retries: u32) {
         let checks = vec![
             ("check_block_height", self.check_block_height),
             ("check_parent_hash", self.check_parent_hash),
@@ -482,21 +554,21 @@ impl AuditLog {
             ("check_cycles", self.check_cycles),
         ];
 
-        let failed_checks: Vec<String> = checks
+        let mut failed_checks: Vec<String> = checks
             .iter()
             .filter_map(|(name, status)| {
                 (*status == CheckStatus::Fail).then_some((*name).to_string())
             })
             .collect();
-        let unknown_checks: Vec<String> = checks
+        let unresolved_checks: Vec<String> = checks
             .iter()
             .filter_map(|(name, status)| {
                 (*status == CheckStatus::Unknown).then_some((*name).to_string())
             })
             .collect();
 
+        failed_checks.extend(unresolved_checks.iter().cloned());
         self.failed_checks = (!failed_checks.is_empty()).then_some(failed_checks);
-        self.unknown_checks = (!unknown_checks.is_empty()).then_some(unknown_checks);
         if self.details_total.unwrap_or(0) > 0 {
             self.details_truncated.get_or_insert(false);
             self.details.get_or_insert_with(Vec::new);
@@ -506,12 +578,39 @@ impl AuditLog {
             self.details_truncated = None;
         }
 
+        if let Some(details) = self.details.as_mut() {
+            for detail in details {
+                match detail.status {
+                    CheckStatus::Fail => {
+                        detail
+                            .failure_kind
+                            .get_or_insert(FailureKind::ValidationFailed);
+                    }
+                    CheckStatus::Unknown => {
+                        detail.status = CheckStatus::Fail;
+                        detail.failure_kind =
+                            Some(if is_retryable_execution_error(&detail.error_code) {
+                                FailureKind::RetryExhausted
+                            } else {
+                                FailureKind::ExecutionFailed
+                            });
+                        if detail.rpc_method.is_none() {
+                            detail.rpc_method =
+                                rpc_method_for_error_code(&detail.error_code).map(str::to_string);
+                        }
+                        detail.attempts = Some(attempts);
+                        detail.max_retries = Some(max_retries);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        self.map_unknown_checks_to_fail();
         self.result = if self.failed_checks.is_some() {
             AuditResult::Fail
-        } else if self.unknown_checks.is_some() {
-            AuditResult::Incomplete
         } else {
-            AuditResult::PassWithinScope
+            AuditResult::Pass
         };
     }
 
@@ -519,6 +618,153 @@ impl AuditLog {
         self.details
             .as_ref()
             .is_some_and(|details| details.iter().any(|detail| detail.check_name == check_name))
+    }
+
+    fn has_unresolved_checks(&self) -> bool {
+        self.check_statuses()
+            .iter()
+            .any(|(_, status)| *status == CheckStatus::Unknown)
+    }
+
+    fn has_non_retryable_execution_failure(&self) -> bool {
+        self.details.as_ref().is_some_and(|details| {
+            details.iter().any(|detail| {
+                detail.status == CheckStatus::Unknown
+                    && !is_block_retryable_execution_error(&detail.error_code)
+            })
+        })
+    }
+
+    fn check_statuses(&self) -> Vec<(&'static str, CheckStatus)> {
+        vec![
+            ("check_block_height", self.check_block_height),
+            ("check_parent_hash", self.check_parent_hash),
+            ("check_epoch_continuity", self.check_epoch_continuity),
+            ("check_timestamp", self.check_timestamp),
+            ("check_block_size", self.check_block_size),
+            ("check_proposal_limit", self.check_proposal_limit),
+            ("check_block_hash", self.check_block_hash),
+            ("check_transaction_hashes", self.check_transaction_hashes),
+            ("check_transactions_root", self.check_transactions_root),
+            ("check_proposals_hash", self.check_proposals_hash),
+            ("check_extra_hash", self.check_extra_hash),
+            (
+                "check_duplicate_transactions",
+                self.check_duplicate_transactions,
+            ),
+            ("check_duplicate_proposals", self.check_duplicate_proposals),
+            ("check_cellbase_structure", self.check_cellbase_structure),
+            ("check_transaction_version", self.check_transaction_version),
+            (
+                "check_inputs_outputs_structure",
+                self.check_inputs_outputs_structure,
+            ),
+            ("check_outputs_data_length", self.check_outputs_data_length),
+            (
+                "check_output_lock_hash_type",
+                self.check_output_lock_hash_type,
+            ),
+            ("check_duplicate_cell_deps", self.check_duplicate_cell_deps),
+            (
+                "check_duplicate_header_deps",
+                self.check_duplicate_header_deps,
+            ),
+            (
+                "check_duplicate_inputs_in_transaction",
+                self.check_duplicate_inputs_in_transaction,
+            ),
+            (
+                "check_duplicate_inputs_in_block",
+                self.check_duplicate_inputs_in_block,
+            ),
+            (
+                "check_input_content_resolution",
+                self.check_input_content_resolution,
+            ),
+            ("check_input_output_index", self.check_input_output_index),
+            ("check_occupied_capacity", self.check_occupied_capacity),
+            (
+                "check_ordinary_capacity_conservation",
+                self.check_ordinary_capacity_conservation,
+            ),
+            (
+                "check_input_historical_liveness",
+                self.check_input_historical_liveness,
+            ),
+            (
+                "check_cellbase_reward_amount",
+                self.check_cellbase_reward_amount,
+            ),
+            (
+                "check_cellbase_reward_target",
+                self.check_cellbase_reward_target,
+            ),
+            (
+                "check_dao_withdraw_capacity",
+                self.check_dao_withdraw_capacity,
+            ),
+            ("check_pow", self.check_pow),
+            (
+                "check_expected_epoch_target",
+                self.check_expected_epoch_target,
+            ),
+            ("check_two_phase_commit", self.check_two_phase_commit),
+            ("check_cellbase_maturity", self.check_cellbase_maturity),
+            ("check_since", self.check_since),
+            (
+                "check_extension_consensus_rules",
+                self.check_extension_consensus_rules,
+            ),
+            ("check_vm_scripts", self.check_vm_scripts),
+            ("check_cycles", self.check_cycles),
+        ]
+    }
+
+    fn map_unknown_checks_to_fail(&mut self) {
+        for status in [
+            &mut self.check_block_height,
+            &mut self.check_parent_hash,
+            &mut self.check_epoch_continuity,
+            &mut self.check_timestamp,
+            &mut self.check_block_size,
+            &mut self.check_proposal_limit,
+            &mut self.check_block_hash,
+            &mut self.check_transaction_hashes,
+            &mut self.check_transactions_root,
+            &mut self.check_proposals_hash,
+            &mut self.check_extra_hash,
+            &mut self.check_duplicate_transactions,
+            &mut self.check_duplicate_proposals,
+            &mut self.check_cellbase_structure,
+            &mut self.check_transaction_version,
+            &mut self.check_inputs_outputs_structure,
+            &mut self.check_outputs_data_length,
+            &mut self.check_output_lock_hash_type,
+            &mut self.check_duplicate_cell_deps,
+            &mut self.check_duplicate_header_deps,
+            &mut self.check_duplicate_inputs_in_transaction,
+            &mut self.check_duplicate_inputs_in_block,
+            &mut self.check_input_content_resolution,
+            &mut self.check_input_output_index,
+            &mut self.check_occupied_capacity,
+            &mut self.check_ordinary_capacity_conservation,
+            &mut self.check_input_historical_liveness,
+            &mut self.check_cellbase_reward_amount,
+            &mut self.check_cellbase_reward_target,
+            &mut self.check_dao_withdraw_capacity,
+            &mut self.check_pow,
+            &mut self.check_expected_epoch_target,
+            &mut self.check_two_phase_commit,
+            &mut self.check_cellbase_maturity,
+            &mut self.check_since,
+            &mut self.check_extension_consensus_rules,
+            &mut self.check_vm_scripts,
+            &mut self.check_cycles,
+        ] {
+            if *status == CheckStatus::Unknown {
+                *status = CheckStatus::Fail;
+            }
+        }
     }
 }
 
@@ -565,7 +811,8 @@ impl HttpRpc {
         params: serde_json::Value,
     ) -> Result<T> {
         let mut last_err = None;
-        for _ in 0..=self.max_retries {
+        let total_attempts = self.max_retries.saturating_add(1);
+        for attempt in 1..=total_attempts {
             let payload = json!({
                 "id": 1,
                 "jsonrpc": "2.0",
@@ -587,7 +834,9 @@ impl HttpRpc {
                                 format!(": {}", body.trim())
                             }
                         ));
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        if attempt < total_attempts {
+                            tokio::time::sleep(retry_backoff(attempt)).await;
+                        }
                         continue;
                     }
                     let value: serde_json::Value = resp
@@ -596,7 +845,9 @@ impl HttpRpc {
                         .with_context(|| format!("rpc {method} invalid json"))?;
                     if let Some(err) = value.get("error") {
                         last_err = Some(anyhow!("rpc {} error: {}", method, err));
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        if attempt < total_attempts {
+                            tokio::time::sleep(retry_backoff(attempt)).await;
+                        }
                         continue;
                     }
                     let result = value
@@ -614,7 +865,9 @@ impl HttpRpc {
                     ));
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if attempt < total_attempts {
+                tokio::time::sleep(retry_backoff(attempt)).await;
+            }
         }
         Err(last_err.unwrap_or_else(|| anyhow!("rpc {} failed", method)))
     }
@@ -810,7 +1063,14 @@ impl<R: CkbRpc> Auditor<R> {
         }
 
         let start_height = if let Some(state) = cursor.as_ref() {
-            self.resolve_common_ancestor(state).await? + 1
+            let completed_start = if state.last_hash.is_empty() && state.history.is_empty() {
+                state.next_height.unwrap_or(tip_height)
+            } else {
+                self.resolve_common_ancestor(state).await? + 1
+            };
+            state
+                .next_height
+                .map_or(completed_start, |pending| pending.min(completed_start))
         } else {
             tip_height
         };
@@ -819,27 +1079,59 @@ impl<R: CkbRpc> Auditor<R> {
         }
 
         for height in start_height..=tip_height {
-            let Some(block) = self.rpc.get_block_by_number(height).await? else {
-                eprintln!("missing block at height {height}, stop this round");
+            let pending_hash = cursor.as_ref().and_then(|state| {
+                (state.next_height == Some(height))
+                    .then(|| state.next_hash.clone())
+                    .flatten()
+            });
+            let Some((block, log, completed)) =
+                self.audit_height_with_retries(height, &consensus).await?
+            else {
                 break;
             };
-            let log = self.audit_block_with_consensus(&block, &consensus).await;
+            let hash = format!("{:#x}", block.header.hash);
+            if pending_hash
+                .as_deref()
+                .is_some_and(|saved| !saved.eq_ignore_ascii_case(&hash))
+            {
+                eprintln!(
+                    "pending retry block changed on canonical chain at height {}: old={} new={}",
+                    height,
+                    pending_hash.unwrap_or_default(),
+                    hash
+                );
+            }
             let line = serde_json::to_string(&log)?;
             self.sink.write_json_line(&line)?;
-            let hash = format!("{:#x}", block.header.hash);
-            if let Some(state) = cursor.as_mut() {
-                state.push_block(height, hash, self.config.history_retention);
-                self.save_cursor(state).await?;
+            if completed {
+                if let Some(state) = cursor.as_mut() {
+                    state.push_block(height, hash, self.config.history_retention);
+                    self.save_cursor(state).await?;
+                } else {
+                    let state = CursorState::new(
+                        format!("{:#x}", consensus.genesis_hash),
+                        height,
+                        hash,
+                        self.config.history_retention,
+                    );
+                    self.save_cursor(&state).await?;
+                    *cursor = Some(state);
+                    eprintln!("initialized cursor at audited tip height {}", height);
+                }
             } else {
-                let state = CursorState::new(
-                    format!("{:#x}", consensus.genesis_hash),
-                    height,
-                    hash,
-                    self.config.history_retention,
-                );
-                self.save_cursor(&state).await?;
-                *cursor = Some(state);
-                eprintln!("initialized cursor at audited tip height {}", height);
+                if let Some(state) = cursor.as_mut() {
+                    state.mark_pending(&block, self.config.history_retention);
+                    self.save_cursor(state).await?;
+                } else {
+                    let state = CursorState::new_pending(
+                        format!("{:#x}", consensus.genesis_hash),
+                        &block,
+                        self.config.history_retention,
+                    );
+                    self.save_cursor(&state).await?;
+                    *cursor = Some(state);
+                }
+                break;
             }
         }
 
@@ -847,6 +1139,12 @@ impl<R: CkbRpc> Auditor<R> {
     }
 
     async fn resolve_common_ancestor(&self, state: &CursorState) -> Result<u64> {
+        if state.last_hash.is_empty() {
+            return Ok(state
+                .next_height
+                .unwrap_or(state.last_height)
+                .saturating_sub(1));
+        }
         let Some(current) = self.rpc.get_header_by_number(state.last_height).await? else {
             return Ok(state.last_height);
         };
@@ -895,6 +1193,48 @@ impl<R: CkbRpc> Auditor<R> {
         Ok(fetched)
     }
 
+    async fn audit_height_with_retries(
+        &self,
+        height: u64,
+        consensus: &ConsensusSnapshot,
+    ) -> Result<Option<(BlockView, AuditLog, bool)>> {
+        let total_attempts = self.config.max_retries.saturating_add(1);
+        for attempt in 1..=total_attempts {
+            let Some(block) = self.rpc.get_block_by_number(height).await? else {
+                eprintln!("missing block at height {height}, stop this round");
+                return Ok(None);
+            };
+            let mut log = self
+                .audit_block_with_consensus_once(&block, consensus)
+                .await;
+            let unresolved = log.has_unresolved_checks();
+            let non_retryable = log.has_non_retryable_execution_failure();
+            if unresolved && !non_retryable && attempt < total_attempts {
+                self.wait_for_retry(attempt, height, &block).await?;
+                continue;
+            }
+            log.finalize(attempt, self.config.max_retries);
+            return Ok(Some((block, log, !unresolved)));
+        }
+        unreachable!("retry loop must return before exhaustion")
+    }
+
+    async fn wait_for_retry(&self, attempt: u32, height: u64, block: &BlockView) -> Result<()> {
+        let delay = retry_backoff(attempt);
+        eprintln!(
+            "retrying height {} block {:#x} after {} ms (attempt {}/{})",
+            height,
+            block.header.hash,
+            delay.as_millis(),
+            attempt + 1,
+            self.config.max_retries.saturating_add(1)
+        );
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => Ok(()),
+            _ = tokio::signal::ctrl_c() => Err(anyhow!("shutdown signal received during retry backoff")),
+        }
+    }
+
     fn push_unknown_detail(
         &self,
         log: &mut AuditLog,
@@ -908,6 +1248,10 @@ impl<R: CkbRpc> Auditor<R> {
                 check_name: check_name.to_string(),
                 status: CheckStatus::Unknown,
                 error_code: error_code.to_string(),
+                failure_kind: None,
+                rpc_method: None,
+                attempts: None,
+                max_retries: None,
                 tx_hash: None,
                 tx_index: None,
                 input_index: None,
@@ -1004,6 +1348,10 @@ impl<R: CkbRpc> Auditor<R> {
                         check_name: check_name.to_string(),
                         status,
                         error_code: error_code.to_string(),
+                        failure_kind: None,
+                        rpc_method: None,
+                        attempts: None,
+                        max_retries: None,
                         tx_hash: None,
                         tx_index: None,
                         input_index: None,
@@ -1023,52 +1371,67 @@ impl<R: CkbRpc> Auditor<R> {
     #[cfg_attr(not(test), allow(dead_code))]
     async fn audit_block(&self, block: &BlockView) -> AuditLog {
         match self.consensus().await {
-            Ok(consensus) => self.audit_block_with_consensus(block, &consensus).await,
+            Ok(consensus) => {
+                let mut log = self
+                    .audit_block_with_consensus_once(block, &consensus)
+                    .await;
+                log.finalize(1, self.config.max_retries);
+                log
+            }
             Err(err) => {
-                let started = Instant::now();
-                let mut log = AuditLog::new(&self.config, block);
-                log.canonical_at_audit = matches!(
-                    self.rpc
-                        .get_header_by_number(block.header.inner.number.value())
-                        .await,
-                    Ok(Some(current)) if current.hash == block.header.hash
-                );
-                let core_block: CoreBlockView = block.clone().into();
-
-                self.audit_header_and_block(block, &core_block, &mut log, None)
-                    .await;
-                self.audit_transactions(block, &core_block, &mut log, None)
-                    .await;
-                self.audit_reward(block, &mut log, None).await;
-
-                let reason = format!("get_consensus unavailable: {err}");
-                for check_name in [
-                    "check_timestamp",
-                    "check_block_size",
-                    "check_proposal_limit",
-                    "check_transaction_version",
-                    "check_ordinary_capacity_conservation",
-                    "check_cellbase_reward_amount",
-                    "check_cellbase_reward_target",
-                    "check_dao_withdraw_capacity",
-                ] {
-                    self.push_unknown_detail(
-                        &mut log,
-                        check_name,
-                        "CONSENSUS_UNAVAILABLE",
-                        reason.clone(),
-                    );
-                }
-
-                self.backfill_anomaly_details(&mut log);
-                log.audit_duration_ms = started.elapsed().as_millis() as u64;
-                log.finalize();
+                let mut log = self.audit_block_without_consensus_once(block, &err).await;
+                log.finalize(1, self.config.max_retries);
                 log
             }
         }
     }
 
-    async fn audit_block_with_consensus(
+    async fn audit_block_without_consensus_once(
+        &self,
+        block: &BlockView,
+        err: &anyhow::Error,
+    ) -> AuditLog {
+        let started = Instant::now();
+        let mut log = AuditLog::new(&self.config, block);
+        log.canonical_at_audit = matches!(
+            self.rpc
+                .get_header_by_number(block.header.inner.number.value())
+                .await,
+            Ok(Some(current)) if current.hash == block.header.hash
+        );
+        let core_block: CoreBlockView = block.clone().into();
+
+        self.audit_header_and_block(block, &core_block, &mut log, None)
+            .await;
+        self.audit_transactions(block, &core_block, &mut log, None)
+            .await;
+        self.audit_reward(block, &mut log, None).await;
+
+        let reason = format!("get_consensus unavailable: {err}");
+        for check_name in [
+            "check_timestamp",
+            "check_block_size",
+            "check_proposal_limit",
+            "check_transaction_version",
+            "check_ordinary_capacity_conservation",
+            "check_cellbase_reward_amount",
+            "check_cellbase_reward_target",
+            "check_dao_withdraw_capacity",
+        ] {
+            self.push_unknown_detail(
+                &mut log,
+                check_name,
+                "CONSENSUS_UNAVAILABLE",
+                reason.clone(),
+            );
+        }
+
+        self.backfill_anomaly_details(&mut log);
+        log.audit_duration_ms = started.elapsed().as_millis() as u64;
+        log
+    }
+
+    async fn audit_block_with_consensus_once(
         &self,
         block: &BlockView,
         consensus: &ConsensusSnapshot,
@@ -1089,7 +1452,6 @@ impl<R: CkbRpc> Auditor<R> {
         self.audit_reward(block, &mut log, Some(consensus)).await;
         self.backfill_anomaly_details(&mut log);
         log.audit_duration_ms = started.elapsed().as_millis() as u64;
-        log.finalize();
         log
     }
 
@@ -1104,6 +1466,7 @@ impl<R: CkbRpc> Auditor<R> {
 
         if header_number == 0 {
             log.check_block_height = CheckStatus::Pass;
+            log.check_parent_hash = CheckStatus::NotApplicable;
             log.check_epoch_continuity = CheckStatus::Pass;
             log.check_timestamp = CheckStatus::Pass;
         } else {
@@ -1120,12 +1483,16 @@ impl<R: CkbRpc> Auditor<R> {
                                 check_name: "check_block_height".to_string(),
                                 status: CheckStatus::Fail,
                                 error_code: "BLOCK_NUMBER_MISMATCH".to_string(),
+                                failure_kind: None,
+                                rpc_method: None,
+                                attempts: None,
+                                max_retries: None,
                                 tx_hash: None,
                                 tx_index: None,
                                 input_index: None,
                                 output_index: None,
                                 referenced_out_point: None,
-                                expected_operator: Some("less_than_or_equal".to_string()),
+                                expected_operator: Some("equal".to_string()),
                                 expected_value: Some((parent_number + 1).to_string()),
                                 actual_value: Some(header_number.to_string()),
                                 unit: Some("block".to_string()),
@@ -1146,6 +1513,10 @@ impl<R: CkbRpc> Auditor<R> {
                                 check_name: "check_parent_hash".to_string(),
                                 status: CheckStatus::Fail,
                                 error_code: "PARENT_HASH_MISMATCH".to_string(),
+                                failure_kind: None,
+                                rpc_method: None,
+                                attempts: None,
+                                max_retries: None,
                                 tx_hash: None,
                                 tx_index: None,
                                 input_index: None,
@@ -1181,6 +1552,10 @@ impl<R: CkbRpc> Auditor<R> {
                                 check_name: "check_epoch_continuity".to_string(),
                                 status: CheckStatus::Fail,
                                 error_code: "EPOCH_CONTINUITY_FAIL".to_string(),
+                                failure_kind: None,
+                                rpc_method: None,
+                                attempts: None,
+                                max_retries: None,
                                 tx_hash: None,
                                 tx_index: None,
                                 input_index: None,
@@ -1240,6 +1615,10 @@ impl<R: CkbRpc> Auditor<R> {
                                         check_name: "check_timestamp".to_string(),
                                         status: CheckStatus::Fail,
                                         error_code: "TIMESTAMP_OUT_OF_RANGE".to_string(),
+                       failure_kind: None,
+                       rpc_method: None,
+                       attempts: None,
+                       max_retries: None,
                                         tx_hash: None,
                                         tx_index: None,
                                         input_index: None,
@@ -1316,6 +1695,10 @@ impl<R: CkbRpc> Auditor<R> {
                                 check_name: check_name.to_string(),
                                 status: CheckStatus::Unknown,
                                 error_code: "PARENT_HEADER_UNAVAILABLE".to_string(),
+                                failure_kind: None,
+                                rpc_method: None,
+                                attempts: None,
+                                max_retries: None,
                                 tx_hash: None,
                                 tx_index: None,
                                 input_index: None,
@@ -1349,6 +1732,10 @@ impl<R: CkbRpc> Auditor<R> {
                         check_name: "check_block_size".to_string(),
                         status: CheckStatus::Fail,
                         error_code: "BLOCK_SIZE_EXCEEDED".to_string(),
+                        failure_kind: None,
+                        rpc_method: None,
+                        attempts: None,
+                        max_retries: None,
                         tx_hash: None,
                         tx_index: None,
                         input_index: None,
@@ -1373,6 +1760,10 @@ impl<R: CkbRpc> Auditor<R> {
                         check_name: "check_proposal_limit".to_string(),
                         status: CheckStatus::Fail,
                         error_code: "PROPOSAL_LIMIT_EXCEEDED".to_string(),
+                        failure_kind: None,
+                        rpc_method: None,
+                        attempts: None,
+                        max_retries: None,
                         tx_hash: None,
                         tx_index: None,
                         input_index: None,
@@ -1403,6 +1794,10 @@ impl<R: CkbRpc> Auditor<R> {
                     check_name: "check_block_hash".to_string(),
                     status: CheckStatus::Fail,
                     error_code: "BLOCK_HASH_MISMATCH".to_string(),
+                    failure_kind: None,
+                    rpc_method: None,
+                    attempts: None,
+                    max_retries: None,
                     tx_hash: None,
                     tx_index: None,
                     input_index: None,
@@ -1436,6 +1831,10 @@ impl<R: CkbRpc> Auditor<R> {
                         check_name: "check_transaction_hashes".to_string(),
                         status: CheckStatus::Fail,
                         error_code: "TRANSACTION_HASH_MISMATCH".to_string(),
+                       failure_kind: None,
+                       rpc_method: None,
+                       attempts: None,
+                       max_retries: None,
                         tx_hash: Some(format!("{:#x}", tx.hash)),
                         tx_index: Some(tx_index),
                         input_index: None,
@@ -1469,6 +1868,10 @@ impl<R: CkbRpc> Auditor<R> {
                     check_name: "check_transactions_root".to_string(),
                     status: CheckStatus::Fail,
                     error_code: "TRANSACTIONS_ROOT_MISMATCH".to_string(),
+                    failure_kind: None,
+                    rpc_method: None,
+                    attempts: None,
+                    max_retries: None,
                     tx_hash: None,
                     tx_index: None,
                     input_index: None,
@@ -1495,6 +1898,10 @@ impl<R: CkbRpc> Auditor<R> {
                     check_name: "check_proposals_hash".to_string(),
                     status: CheckStatus::Fail,
                     error_code: "PROPOSALS_HASH_MISMATCH".to_string(),
+                    failure_kind: None,
+                    rpc_method: None,
+                    attempts: None,
+                    max_retries: None,
                     tx_hash: None,
                     tx_index: None,
                     input_index: None,
@@ -1520,6 +1927,10 @@ impl<R: CkbRpc> Auditor<R> {
                     check_name: "check_extra_hash".to_string(),
                     status: CheckStatus::Fail,
                     error_code: "EXTRA_HASH_MISMATCH".to_string(),
+                    failure_kind: None,
+                    rpc_method: None,
+                    attempts: None,
+                    max_retries: None,
                     tx_hash: None,
                     tx_index: None,
                     input_index: None,
@@ -1547,6 +1958,10 @@ impl<R: CkbRpc> Auditor<R> {
                         check_name: "check_duplicate_transactions".to_string(),
                         status: CheckStatus::Fail,
                         error_code: "DUPLICATE_TRANSACTION".to_string(),
+                        failure_kind: None,
+                        rpc_method: None,
+                        attempts: None,
+                        max_retries: None,
                         tx_hash: Some(format!("{:#x}", tx.hash)),
                         tx_index: Some(tx_index),
                         input_index: None,
@@ -1580,6 +1995,10 @@ impl<R: CkbRpc> Auditor<R> {
                         check_name: "check_duplicate_proposals".to_string(),
                         status: CheckStatus::Fail,
                         error_code: "DUPLICATE_PROPOSAL".to_string(),
+                        failure_kind: None,
+                        rpc_method: None,
+                        attempts: None,
+                        max_retries: None,
                         tx_hash: None,
                         tx_index: None,
                         input_index: None,
@@ -1612,6 +2031,10 @@ impl<R: CkbRpc> Auditor<R> {
                     check_name: "check_cellbase_structure".to_string(),
                     status: CheckStatus::Fail,
                     error_code: "CELLBASE_MISSING".to_string(),
+                    failure_kind: None,
+                    rpc_method: None,
+                    attempts: None,
+                    max_retries: None,
                     tx_hash: None,
                     tx_index: None,
                     input_index: None,
@@ -1637,6 +2060,10 @@ impl<R: CkbRpc> Auditor<R> {
                     check_name: "check_cellbase_structure".to_string(),
                     status,
                     error_code: "CELLBASE_FIRST_TRANSACTION_INVALID".to_string(),
+                    failure_kind: None,
+                    rpc_method: None,
+                    attempts: None,
+                    max_retries: None,
                     tx_hash: Some(format!("{:#x}", first_tx.hash)),
                     tx_index: Some(0),
                     input_index: None,
@@ -1661,6 +2088,10 @@ impl<R: CkbRpc> Auditor<R> {
                         check_name: "check_cellbase_structure".to_string(),
                         status,
                         error_code: "MULTIPLE_CELLBASE_TRANSACTIONS".to_string(),
+                        failure_kind: None,
+                        rpc_method: None,
+                        attempts: None,
+                        max_retries: None,
                         tx_hash: Some(format!("{:#x}", tx.hash)),
                         tx_index: Some(tx_index),
                         input_index: None,
@@ -1687,6 +2118,10 @@ impl<R: CkbRpc> Auditor<R> {
                     check_name: "check_cellbase_structure".to_string(),
                     status,
                     error_code: "CELLBASE_OUTPUT_STRUCTURE_INVALID".to_string(),
+                    failure_kind: None,
+                    rpc_method: None,
+                    attempts: None,
+                    max_retries: None,
                     tx_hash: Some(format!("{:#x}", first_tx.hash)),
                     tx_index: Some(0),
                     input_index: None,
@@ -1717,6 +2152,10 @@ impl<R: CkbRpc> Auditor<R> {
                         check_name: "check_cellbase_structure".to_string(),
                         status,
                         error_code: "CELLBASE_PREVIOUS_OUTPUT_NOT_NULL".to_string(),
+                        failure_kind: None,
+                        rpc_method: None,
+                        attempts: None,
+                        max_retries: None,
                         tx_hash: Some(format!("{:#x}", first_tx.hash)),
                         tx_index: Some(0),
                         input_index: Some(0),
@@ -1742,6 +2181,10 @@ impl<R: CkbRpc> Auditor<R> {
                         check_name: "check_cellbase_structure".to_string(),
                         status,
                         error_code: "CELLBASE_SINCE_MISMATCH".to_string(),
+                        failure_kind: None,
+                        rpc_method: None,
+                        attempts: None,
+                        max_retries: None,
                         tx_hash: Some(format!("{:#x}", first_tx.hash)),
                         tx_index: Some(0),
                         input_index: Some(0),
@@ -1763,6 +2206,10 @@ impl<R: CkbRpc> Auditor<R> {
                     check_name: "check_cellbase_structure".to_string(),
                     status,
                     error_code: "CELLBASE_INPUT_MISSING".to_string(),
+                    failure_kind: None,
+                    rpc_method: None,
+                    attempts: None,
+                    max_retries: None,
                     tx_hash: Some(format!("{:#x}", first_tx.hash)),
                     tx_index: Some(0),
                     input_index: None,
@@ -1785,6 +2232,10 @@ impl<R: CkbRpc> Auditor<R> {
                     check_name: "check_cellbase_structure".to_string(),
                     status,
                     error_code: "CELLBASE_WITNESS_COUNT_INVALID".to_string(),
+                    failure_kind: None,
+                    rpc_method: None,
+                    attempts: None,
+                    max_retries: None,
                     tx_hash: Some(format!("{:#x}", first_tx.hash)),
                     tx_index: Some(0),
                     input_index: None,
@@ -1809,6 +2260,10 @@ impl<R: CkbRpc> Auditor<R> {
                     check_name: "check_cellbase_structure".to_string(),
                     status,
                     error_code: "CELLBASE_WITNESS_INVALID".to_string(),
+                    failure_kind: None,
+                    rpc_method: None,
+                    attempts: None,
+                    max_retries: None,
                     tx_hash: Some(format!("{:#x}", first_tx.hash)),
                     tx_index: Some(0),
                     input_index: None,
@@ -1833,6 +2288,10 @@ impl<R: CkbRpc> Auditor<R> {
                     check_name: "check_cellbase_structure".to_string(),
                     status,
                     error_code: "CELLBASE_TYPE_SCRIPT_PRESENT".to_string(),
+                    failure_kind: None,
+                    rpc_method: None,
+                    attempts: None,
+                    max_retries: None,
                     tx_hash: Some(format!("{:#x}", first_tx.hash)),
                     tx_index: Some(0),
                     input_index: None,
@@ -1859,6 +2318,10 @@ impl<R: CkbRpc> Auditor<R> {
                     check_name: "check_cellbase_structure".to_string(),
                     status,
                     error_code: "CELLBASE_OUTPUT_DATA_NOT_EMPTY".to_string(),
+                    failure_kind: None,
+                    rpc_method: None,
+                    attempts: None,
+                    max_retries: None,
                     tx_hash: Some(format!("{:#x}", first_tx.hash)),
                     tx_index: Some(0),
                     input_index: None,
@@ -1961,6 +2424,10 @@ impl<R: CkbRpc> Auditor<R> {
                 check_name: check_name.to_string(),
                 status,
                 error_code: error_code.to_string(),
+                failure_kind: None,
+                rpc_method: None,
+                attempts: None,
+                max_retries: None,
                 tx_hash: Some(format!("{tx_hash:#x}")),
                 tx_index: Some(tx_index),
                 input_index: Some(input_index),
@@ -2074,7 +2541,7 @@ impl<R: CkbRpc> Auditor<R> {
         let mut overall_tx_version = CheckStatus::NotApplicable;
         let mut overall_struct = CheckStatus::NotApplicable;
         let mut overall_data_len = CheckStatus::NotApplicable;
-        let mut overall_lock_hash_type = CheckStatus::NotApplicable;
+        let overall_lock_hash_type = CheckStatus::NotImplemented;
         let mut overall_dup_cell_dep = CheckStatus::NotApplicable;
         let mut overall_dup_header_dep = CheckStatus::NotApplicable;
         let mut overall_dup_input_tx = CheckStatus::NotApplicable;
@@ -2097,7 +2564,6 @@ impl<R: CkbRpc> Auditor<R> {
             overall_tx_version = merge_status(overall_tx_version, CheckStatus::Pass);
             overall_struct = merge_status(overall_struct, CheckStatus::Pass);
             overall_data_len = merge_status(overall_data_len, CheckStatus::Pass);
-            overall_lock_hash_type = merge_status(overall_lock_hash_type, CheckStatus::Pass);
             overall_dup_cell_dep = merge_status(overall_dup_cell_dep, CheckStatus::Pass);
             overall_dup_header_dep = merge_status(overall_dup_header_dep, CheckStatus::Pass);
             overall_dup_input_tx = merge_status(overall_dup_input_tx, CheckStatus::Pass);
@@ -2115,6 +2581,10 @@ impl<R: CkbRpc> Auditor<R> {
                             check_name: "check_transaction_version".to_string(),
                             status: CheckStatus::Fail,
                             error_code: "TRANSACTION_VERSION_MISMATCH".to_string(),
+                            failure_kind: None,
+                            rpc_method: None,
+                            attempts: None,
+                            max_retries: None,
                             tx_hash: Some(format!("{:#x}", tx.hash)),
                             tx_index: Some(tx_index),
                             input_index: None,
@@ -2141,6 +2611,10 @@ impl<R: CkbRpc> Auditor<R> {
                         check_name: "check_inputs_outputs_structure".to_string(),
                         status: CheckStatus::Fail,
                         error_code: "TRANSACTION_IO_EMPTY".to_string(),
+                       failure_kind: None,
+                       rpc_method: None,
+                       attempts: None,
+                       max_retries: None,
                         tx_hash: Some(format!("{:#x}", tx.hash)),
                         tx_index: Some(tx_index),
                         input_index: None,
@@ -2168,6 +2642,10 @@ impl<R: CkbRpc> Auditor<R> {
                         check_name: "check_outputs_data_length".to_string(),
                         status: CheckStatus::Fail,
                         error_code: "OUTPUTS_DATA_LENGTH_MISMATCH".to_string(),
+                        failure_kind: None,
+                        rpc_method: None,
+                        attempts: None,
+                        max_retries: None,
                         tx_hash: Some(format!("{:#x}", tx.hash)),
                         tx_index: Some(tx_index),
                         input_index: None,
@@ -2199,6 +2677,10 @@ impl<R: CkbRpc> Auditor<R> {
                         check_name: "check_duplicate_cell_deps".to_string(),
                         status: CheckStatus::Fail,
                         error_code: "DUPLICATE_CELL_DEP".to_string(),
+                        failure_kind: None,
+                        rpc_method: None,
+                        attempts: None,
+                        max_retries: None,
                         tx_hash: Some(format!("{:#x}", tx.hash)),
                         tx_index: Some(tx_index),
                         input_index: None,
@@ -2227,6 +2709,10 @@ impl<R: CkbRpc> Auditor<R> {
                         check_name: "check_duplicate_header_deps".to_string(),
                         status: CheckStatus::Fail,
                         error_code: "DUPLICATE_HEADER_DEP".to_string(),
+                        failure_kind: None,
+                        rpc_method: None,
+                        attempts: None,
+                        max_retries: None,
                         tx_hash: Some(format!("{:#x}", tx.hash)),
                         tx_index: Some(tx_index),
                         input_index: None,
@@ -2257,6 +2743,10 @@ impl<R: CkbRpc> Auditor<R> {
                         check_name: "check_duplicate_inputs_in_transaction".to_string(),
                         status: CheckStatus::Fail,
                         error_code: "DUPLICATE_INPUT_IN_TRANSACTION".to_string(),
+                        failure_kind: None,
+                        rpc_method: None,
+                        attempts: None,
+                        max_retries: None,
                         tx_hash: Some(format!("{:#x}", tx.hash)),
                         tx_index: Some(tx_index),
                         input_index: None,
@@ -2286,6 +2776,10 @@ impl<R: CkbRpc> Auditor<R> {
                         check_name: "check_duplicate_inputs_in_block".to_string(),
                         status: CheckStatus::Fail,
                         error_code: "DUPLICATE_INPUT_IN_BLOCK".to_string(),
+                       failure_kind: None,
+                       rpc_method: None,
+                       attempts: None,
+                       max_retries: None,
                         tx_hash: Some(format!("{:#x}", tx.hash)),
                         tx_index: Some(tx_index),
                         input_index: None,
@@ -2323,6 +2817,10 @@ impl<R: CkbRpc> Auditor<R> {
                                     check_name: "check_ordinary_capacity_conservation".to_string(),
                                     status: CheckStatus::Fail,
                                     error_code: "OUTPUT_CAPACITY_SUM_OVERFLOW".to_string(),
+                       failure_kind: None,
+                       rpc_method: None,
+                       attempts: None,
+                       max_retries: None,
                                     tx_hash: Some(format!("{:#x}", tx.hash)),
                                     tx_index: Some(tx_index),
                                     input_index: None,
@@ -2345,7 +2843,12 @@ impl<R: CkbRpc> Auditor<R> {
                     .get(output_index)
                     .and_then(|data| OccupiedCapacity::bytes(data.len()).ok())
                     .unwrap_or_else(OccupiedCapacity::zero);
-                if packed::CellOutput::from(output.clone())
+                let packed_output = packed::CellOutput::from(output.clone());
+                let occupied_capacity = packed_output
+                    .occupied_capacity(data_capacity)
+                    .ok()
+                    .map(|capacity| capacity.as_u64());
+                if packed_output
                     .is_lack_of_capacity(data_capacity)
                     .unwrap_or(true)
                 {
@@ -2357,13 +2860,17 @@ impl<R: CkbRpc> Auditor<R> {
                             check_name: "check_occupied_capacity".to_string(),
                             status: CheckStatus::Fail,
                             error_code: "OUTPUT_BELOW_OCCUPIED_CAPACITY".to_string(),
+                            failure_kind: None,
+                            rpc_method: None,
+                            attempts: None,
+                            max_retries: None,
                             tx_hash: Some(format!("{:#x}", tx.hash)),
                             tx_index: Some(tx_index),
                             input_index: None,
                             output_index: Some(output_index),
                             referenced_out_point: None,
                             expected_operator: Some("greater_than_or_equal".to_string()),
-                            expected_value: Some(data_capacity.as_u64().to_string()),
+                            expected_value: occupied_capacity.map(|value| value.to_string()),
                             actual_value: Some(output.capacity.value().to_string()),
                             unit: Some("shannon".to_string()),
                             reason:
@@ -2471,6 +2978,7 @@ impl<R: CkbRpc> Auditor<R> {
                         Err(issue) => {
                             tx_unknown = true;
                             classification_unknown = true;
+                            overall_dao_capacity = merge_status(overall_dao_capacity, issue.status);
                             self.push_input_detail(
                                 log,
                                 "check_dao_withdraw_capacity",
@@ -2490,6 +2998,8 @@ impl<R: CkbRpc> Auditor<R> {
                 } else if resolved.block_hash == H256::default() {
                     tx_unknown = true;
                     classification_unknown = true;
+                    overall_input_resolution =
+                        merge_status(overall_input_resolution, CheckStatus::Unknown);
                     self.push_input_detail(
                         log,
                         "check_input_content_resolution",
@@ -2528,6 +3038,10 @@ impl<R: CkbRpc> Auditor<R> {
                             check_name: "check_dao_withdraw_capacity".to_string(),
                             status: CheckStatus::Fail,
                             error_code: "DAO_WITHDRAW_CAPACITY_EXCEEDED".to_string(),
+                            failure_kind: None,
+                            rpc_method: None,
+                            attempts: None,
+                            max_retries: None,
                             tx_hash: Some(format!("{:#x}", tx.hash)),
                             tx_index: Some(tx_index),
                             input_index: None,
@@ -2590,6 +3104,10 @@ impl<R: CkbRpc> Auditor<R> {
                             check_name: "check_ordinary_capacity_conservation".to_string(),
                             status: CheckStatus::Fail,
                             error_code: "OUTPUT_CAPACITY_EXCEEDS_INPUT".to_string(),
+                            failure_kind: None,
+                            rpc_method: None,
+                            attempts: None,
+                            max_retries: None,
                             tx_hash: Some(format!("{:#x}", tx.hash)),
                             tx_index: Some(tx_index),
                             input_index: None,
@@ -2637,6 +3155,10 @@ impl<R: CkbRpc> Auditor<R> {
                     check_name: "check_cellbase_reward_amount".to_string(),
                     status: CheckStatus::Fail,
                     error_code: "CELLBASE_MISSING".to_string(),
+                    failure_kind: None,
+                    rpc_method: None,
+                    attempts: None,
+                    max_retries: None,
                     tx_hash: None,
                     tx_index: None,
                     input_index: None,
@@ -2696,6 +3218,10 @@ impl<R: CkbRpc> Auditor<R> {
                         check_name: "check_cellbase_reward_target".to_string(),
                         status,
                         error_code: "REWARD_FINALIZATION_NOT_READY".to_string(),
+                       failure_kind: None,
+                       rpc_method: None,
+                       attempts: None,
+                       max_retries: None,
                         tx_hash: Some(format!("{:#x}", cellbase.hash)),
                         tx_index: Some(0),
                         input_index: None,
@@ -2889,6 +3415,10 @@ impl<R: CkbRpc> Auditor<R> {
                                 check_name: "check_cellbase_reward_target".to_string(),
                                 status,
                                 error_code: "REWARD_BELOW_OCCUPIED_CAPACITY".to_string(),
+                       failure_kind: None,
+                       rpc_method: None,
+                       attempts: None,
+                       max_retries: None,
                                 tx_hash: Some(format!("{:#x}", cellbase.hash)),
                                 tx_index: Some(0),
                                 input_index: None,
@@ -2915,6 +3445,10 @@ impl<R: CkbRpc> Auditor<R> {
                             check_name: "check_cellbase_reward_amount".to_string(),
                             status: CheckStatus::Fail,
                             error_code: "CELLBASE_REWARD_MISMATCH".to_string(),
+                       failure_kind: None,
+                       rpc_method: None,
+                       attempts: None,
+                       max_retries: None,
                             tx_hash: Some(format!("{:#x}", cellbase.hash)),
                             tx_index: Some(0),
                             input_index: None,
@@ -2938,6 +3472,10 @@ impl<R: CkbRpc> Auditor<R> {
                             check_name: "check_cellbase_reward_target".to_string(),
                             status: CheckStatus::Fail,
                             error_code: "CELLBASE_REWARD_TARGET_MISSING".to_string(),
+                       failure_kind: None,
+                       rpc_method: None,
+                       attempts: None,
+                       max_retries: None,
                             tx_hash: Some(format!("{:#x}", cellbase.hash)),
                             tx_index: Some(0),
                             input_index: None,
@@ -2973,6 +3511,10 @@ impl<R: CkbRpc> Auditor<R> {
                                 check_name: "check_cellbase_reward_target".to_string(),
                                 status: CheckStatus::Fail,
                                 error_code: "CELLBASE_REWARD_TARGET_MISMATCH".to_string(),
+                       failure_kind: None,
+                       rpc_method: None,
+                       attempts: None,
+                       max_retries: None,
                                 tx_hash: Some(format!("{:#x}", cellbase.hash)),
                                 tx_index: Some(0),
                                 input_index: None,
@@ -3000,6 +3542,10 @@ impl<R: CkbRpc> Auditor<R> {
                         check_name: "check_cellbase_reward_amount".to_string(),
                         status: CheckStatus::Unknown,
                         error_code: "ECONOMIC_STATE_MISSING".to_string(),
+                       failure_kind: None,
+                       rpc_method: None,
+                       attempts: None,
+                       max_retries: None,
                         tx_hash: None,
                         tx_index: None,
                         input_index: None,
@@ -3034,6 +3580,10 @@ impl<R: CkbRpc> Auditor<R> {
                         check_name: "check_cellbase_reward_amount".to_string(),
                         status: CheckStatus::Unknown,
                         error_code: "ECONOMIC_STATE_RPC_ERROR".to_string(),
+                       failure_kind: None,
+                       rpc_method: None,
+                       attempts: None,
+                       max_retries: None,
                         tx_hash: None,
                         tx_index: None,
                         input_index: None,
@@ -3076,6 +3626,101 @@ fn merge_status(old: CheckStatus, new_status: CheckStatus) -> CheckStatus {
         new_status
     } else {
         old
+    }
+}
+
+fn retry_backoff(attempt: u32) -> std::time::Duration {
+    let factor = 1u64 << attempt.saturating_sub(1).min(6);
+    std::time::Duration::from_millis(RETRY_BASE_DELAY_MS.saturating_mul(factor))
+}
+
+fn is_retryable_execution_error(error_code: &str) -> bool {
+    matches!(
+        error_code,
+        "PARENT_HEADER_MISSING"
+            | "PARENT_HEADER_UNAVAILABLE"
+            | "TIMESTAMP_ANCESTOR_UNAVAILABLE"
+            | "TIMESTAMP_MEDIAN_INCOMPLETE"
+            | "INPUT_TX_NOT_COMMITTED"
+            | "INPUT_TX_BLOCK_HASH_MISSING"
+            | "INPUT_TX_JSON_MISSING"
+            | "INPUT_TX_MISSING"
+            | "INPUT_TX_RPC_ERROR"
+            | "INPUT_INDEX_UNVERIFIED"
+            | "INPUT_SOURCE_BLOCK_HASH_ZERO"
+            | "ORDINARY_CAPACITY_CLASSIFICATION_UNKNOWN"
+            | "ORDINARY_CAPACITY_INCOMPLETE"
+            | "DAO_WITHDRAW_CAPACITY_INCOMPLETE"
+            | "DAO_CLASSIFICATION_UNKNOWN"
+            | "REWARD_TARGET_HEADER_MISSING"
+            | "REWARD_TARGET_HEADER_RPC_ERROR"
+            | "REWARD_FINALIZATION_MISMATCH"
+            | "REWARD_TARGET_BLOCK_MISMATCH"
+            | "REWARD_TARGET_BLOCK_MISSING"
+            | "REWARD_TARGET_BLOCK_RPC_ERROR"
+            | "REWARD_TARGET_CELLBASE_MISSING"
+            | "REWARD_TARGET_WITNESS_INVALID"
+            | "ECONOMIC_STATE_MISSING"
+            | "ECONOMIC_STATE_RPC_ERROR"
+            | "DAO_MAXIMUM_WITHDRAW_MISSING"
+            | "DAO_MAXIMUM_WITHDRAW_RPC_ERROR"
+            | "CONSENSUS_UNAVAILABLE"
+    )
+}
+
+fn is_block_retryable_execution_error(error_code: &str) -> bool {
+    matches!(
+        error_code,
+        "PARENT_HEADER_MISSING"
+            | "TIMESTAMP_MEDIAN_INCOMPLETE"
+            | "INPUT_TX_NOT_COMMITTED"
+            | "INPUT_TX_BLOCK_HASH_MISSING"
+            | "INPUT_TX_JSON_MISSING"
+            | "INPUT_TX_MISSING"
+            | "INPUT_INDEX_UNVERIFIED"
+            | "INPUT_SOURCE_BLOCK_HASH_ZERO"
+            | "ORDINARY_CAPACITY_CLASSIFICATION_UNKNOWN"
+            | "ORDINARY_CAPACITY_INCOMPLETE"
+            | "DAO_WITHDRAW_CAPACITY_INCOMPLETE"
+            | "DAO_CLASSIFICATION_UNKNOWN"
+            | "REWARD_TARGET_HEADER_MISSING"
+            | "REWARD_FINALIZATION_MISMATCH"
+            | "REWARD_TARGET_BLOCK_MISMATCH"
+            | "REWARD_TARGET_BLOCK_MISSING"
+            | "REWARD_TARGET_CELLBASE_MISSING"
+            | "REWARD_TARGET_WITNESS_INVALID"
+            | "ECONOMIC_STATE_MISSING"
+            | "DAO_MAXIMUM_WITHDRAW_MISSING"
+    )
+}
+
+fn rpc_method_for_error_code(error_code: &str) -> Option<&'static str> {
+    match error_code {
+        "PARENT_HEADER_MISSING"
+        | "PARENT_HEADER_UNAVAILABLE"
+        | "TIMESTAMP_ANCESTOR_UNAVAILABLE" => Some("get_header"),
+        "INPUT_TX_NOT_COMMITTED"
+        | "INPUT_TX_BLOCK_HASH_MISSING"
+        | "INPUT_TX_JSON_MISSING"
+        | "INPUT_TX_MISSING"
+        | "INPUT_TX_RPC_ERROR"
+        | "INPUT_INDEX_UNVERIFIED"
+        | "INPUT_SOURCE_BLOCK_HASH_ZERO" => Some("get_transaction"),
+        "REWARD_TARGET_HEADER_MISSING" | "REWARD_TARGET_HEADER_RPC_ERROR" => {
+            Some("get_header_by_number")
+        }
+        "REWARD_FINALIZATION_MISMATCH" | "ECONOMIC_STATE_MISSING" | "ECONOMIC_STATE_RPC_ERROR" => {
+            Some("get_block_economic_state")
+        }
+        "REWARD_TARGET_BLOCK_MISMATCH"
+        | "REWARD_TARGET_BLOCK_MISSING"
+        | "REWARD_TARGET_BLOCK_RPC_ERROR"
+        | "REWARD_TARGET_CELLBASE_MISSING"
+        | "REWARD_TARGET_WITNESS_INVALID" => Some("get_block"),
+        "DAO_MAXIMUM_WITHDRAW_MISSING" | "DAO_MAXIMUM_WITHDRAW_RPC_ERROR" => {
+            Some("calculate_dao_maximum_withdraw")
+        }
+        _ => None,
     }
 }
 
@@ -3122,6 +3767,7 @@ mod tests {
     use ckb_jsonrpc_types::{Capacity, TxStatus};
     use ckb_types::core::{BlockBuilder, HeaderBuilder, TransactionBuilder};
     use ckb_types::packed::{Byte32, CellInput, CellOutput, OutPoint as PackedOutPoint, ScriptOpt};
+    use std::collections::VecDeque;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Mutex;
@@ -3216,6 +3862,148 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RetryRpc {
+        base: MockRpc,
+        tx_sequence: Mutex<HashMap<String, VecDeque<Option<serde_json::Value>>>>,
+        tx_call_count: Mutex<HashMap<String, usize>>,
+    }
+
+    impl RetryRpc {
+        fn queue_tx_sequence(&self, hash: &H256, values: Vec<Option<serde_json::Value>>) {
+            self.tx_sequence
+                .lock()
+                .unwrap()
+                .insert(format!("{hash:#x}"), VecDeque::from(values));
+        }
+
+        fn tx_calls(&self, hash: &H256) -> usize {
+            self.tx_call_count
+                .lock()
+                .unwrap()
+                .get(&format!("{hash:#x}"))
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    #[async_trait]
+    impl CkbRpc for RetryRpc {
+        async fn get_tip_header(&self) -> Result<Option<HeaderView>> {
+            Ok(self.base.tip.lock().unwrap().clone())
+        }
+
+        async fn get_block(&self, hash: &H256) -> Result<Option<BlockView>> {
+            Ok(self
+                .base
+                .blocks_by_hash
+                .lock()
+                .unwrap()
+                .get(&format!("{hash:#x}"))
+                .cloned())
+        }
+
+        async fn get_header_by_number(&self, number: u64) -> Result<Option<HeaderView>> {
+            Ok(self
+                .base
+                .headers_by_number
+                .lock()
+                .unwrap()
+                .get(&number)
+                .cloned())
+        }
+
+        async fn get_header(&self, hash: &H256) -> Result<Option<HeaderView>> {
+            Ok(self
+                .base
+                .headers_by_hash
+                .lock()
+                .unwrap()
+                .get(&format!("{hash:#x}"))
+                .cloned())
+        }
+
+        async fn get_block_by_number(&self, number: u64) -> Result<Option<BlockView>> {
+            Ok(self
+                .base
+                .blocks_by_number
+                .lock()
+                .unwrap()
+                .get(&number)
+                .cloned())
+        }
+
+        async fn get_transaction(
+            &self,
+            hash: &H256,
+        ) -> Result<Option<TransactionWithStatusResponse>> {
+            let key = format!("{hash:#x}");
+            *self
+                .tx_call_count
+                .lock()
+                .unwrap()
+                .entry(key.clone())
+                .or_default() += 1;
+            if let Some(values) = self.tx_sequence.lock().unwrap().get_mut(&key)
+                && let Some(value) = values.pop_front()
+            {
+                return value
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(Into::into);
+            }
+            Ok(self
+                .base
+                .txs
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?)
+        }
+
+        async fn get_block_economic_state(
+            &self,
+            hash: &H256,
+        ) -> Result<Option<BlockEconomicState>> {
+            Ok(self
+                .base
+                .economics
+                .lock()
+                .unwrap()
+                .get(&format!("{hash:#x}"))
+                .cloned())
+        }
+
+        async fn get_consensus(&self) -> Result<RpcConsensus> {
+            self.base
+                .consensus
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| anyhow!("mock consensus missing"))
+        }
+
+        async fn calculate_dao_maximum_withdraw(
+            &self,
+            out_point: OutPoint,
+            _kind: DaoWithdrawingCalculationKind,
+        ) -> Result<Option<Uint64>> {
+            Ok(self
+                .base
+                .dao_max
+                .lock()
+                .unwrap()
+                .get(&format!(
+                    "{:#x}:{}",
+                    out_point.tx_hash,
+                    out_point.index.value()
+                ))
+                .cloned())
+        }
+    }
+
     #[test]
     fn test_epoch_continuity() {
         let parent = EpochNumberWithFraction::new(10, 1, 100).full_value();
@@ -3234,6 +4022,8 @@ mod tests {
             genesis_hash: Some(format!("{:#x}", H256::from([1u8; 32]))),
             last_height: 1,
             last_hash: "0x1".to_string(),
+            next_height: None,
+            next_hash: None,
             history: BTreeMap::from([(1, "0x1".to_string())]),
         };
         c.save(&path).await.unwrap();
@@ -3317,6 +4107,29 @@ mod tests {
             .lock(simple_lock_script())
             .type_(ScriptOpt::default())
             .build()
+    }
+
+    fn empty_cellbase(block_number: u64) -> ckb_types::core::TransactionView {
+        TransactionBuilder::default()
+            .version(0u32)
+            .input(CellInput::new_cellbase_input(block_number))
+            .witness(simple_lock_script().into_witness())
+            .build()
+    }
+
+    fn committed_tx_response(
+        tx: &ckb_types::core::TransactionView,
+        block_hash: H256,
+    ) -> TransactionWithStatusResponse {
+        let tx_json: TransactionView = tx.clone().into();
+        TransactionWithStatusResponse {
+            transaction: Some(ResponseFormat::json(tx_json)),
+            cycles: None,
+            time_added_to_pool: None,
+            tx_status: TxStatus::committed(1u64.into(), block_hash, 0u32.into()),
+            fee: None,
+            min_replace_fee: None,
+        }
     }
 
     fn lock_script_with_byte(
@@ -3407,11 +4220,14 @@ mod tests {
         let cfg = test_config(cursor_path.clone());
 
         let tip_header = HeaderBuilder::default()
-            .number(100u64)
+            .number(0u64)
             .timestamp(1000u64)
-            .epoch(EpochNumberWithFraction::new(0, 100, 1000).full_value())
+            .epoch(EpochNumberWithFraction::new(0, 0, 1000).full_value())
             .build();
-        let tip_block = BlockBuilder::default().header(tip_header.clone()).build();
+        let tip_block = BlockBuilder::default()
+            .header(tip_header.clone())
+            .transaction(empty_cellbase(0))
+            .build();
         let tip_json: HeaderView = tip_header.into();
         let tip_block_json: BlockView = tip_block.clone().into();
 
@@ -3421,14 +4237,14 @@ mod tests {
         rpc.blocks_by_number
             .lock()
             .unwrap()
-            .insert(100, tip_block_json);
+            .insert(0, tip_block_json);
 
         let auditor = Auditor::new(rpc, cfg);
         let mut cursor = None;
         auditor.poll_once(&mut cursor).await.unwrap();
 
         let loaded = CursorState::load(&cursor_path).await.unwrap().unwrap();
-        assert_eq!(loaded.last_height, 100);
+        assert_eq!(loaded.last_height, 0);
         assert_eq!(
             loaded.genesis_hash,
             Some(format!("{:#x}", H256::from([1u8; 32])))
@@ -3443,60 +4259,79 @@ mod tests {
         cfg.cursor_path = None;
         cfg.log_path = Some(log_path.clone());
 
-        let header_100 = HeaderBuilder::default()
-            .number(100u64)
-            .timestamp(1000u64)
-            .epoch(EpochNumberWithFraction::new(0, 100, 1000).full_value())
-            .build();
-        let header_101 = HeaderBuilder::default()
-            .number(101u64)
-            .timestamp(1010u64)
-            .epoch(EpochNumberWithFraction::new(0, 101, 1000).full_value())
-            .parent_hash(header_100.hash())
-            .build();
-        let header_102 = HeaderBuilder::default()
-            .number(102u64)
-            .timestamp(1020u64)
-            .epoch(EpochNumberWithFraction::new(0, 102, 1000).full_value())
-            .parent_hash(header_101.hash())
-            .build();
-        let header_105 = HeaderBuilder::default()
-            .number(105u64)
-            .timestamp(1050u64)
-            .epoch(EpochNumberWithFraction::new(0, 105, 1000).full_value())
-            .build();
-
-        let block_100: BlockView = BlockBuilder::default()
-            .header(header_100.clone())
+        let block_0: BlockView = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(0u64)
+                    .timestamp(1000u64)
+                    .epoch(EpochNumberWithFraction::new(0, 0, 1000).full_value())
+                    .build(),
+            )
+            .transaction(empty_cellbase(0))
             .build()
             .into();
-        let block_101: BlockView = BlockBuilder::default()
-            .header(header_101.clone())
+        let block_1: BlockView = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(1u64)
+                    .timestamp(1010u64)
+                    .epoch(EpochNumberWithFraction::new(0, 1, 1000).full_value())
+                    .parent_hash(block_0.header.hash.pack())
+                    .build(),
+            )
+            .transaction(empty_cellbase(1))
             .build()
             .into();
-        let block_102: BlockView = BlockBuilder::default()
-            .header(header_102.clone())
+        let block_2: BlockView = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(2u64)
+                    .timestamp(1020u64)
+                    .epoch(EpochNumberWithFraction::new(0, 2, 1000).full_value())
+                    .parent_hash(block_1.header.hash.pack())
+                    .build(),
+            )
+            .transaction(empty_cellbase(2))
             .build()
             .into();
-        let block_105: BlockView = BlockBuilder::default()
-            .header(header_105.clone())
+        let block_4: BlockView = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(4u64)
+                    .timestamp(1040u64)
+                    .epoch(EpochNumberWithFraction::new(0, 4, 1000).full_value())
+                    .build(),
+            )
+            .transaction(empty_cellbase(4))
+            .build()
+            .into();
+        let block_5: BlockView = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(5u64)
+                    .timestamp(1050u64)
+                    .epoch(EpochNumberWithFraction::new(0, 5, 1000).full_value())
+                    .parent_hash(block_4.header.hash.pack())
+                    .build(),
+            )
+            .transaction(empty_cellbase(5))
             .build()
             .into();
 
         let rpc = Arc::new(MockRpc::default());
         *rpc.consensus.lock().unwrap() = Some(mock_consensus());
-        *rpc.tip.lock().unwrap() = Some(block_100.header.clone());
+        *rpc.tip.lock().unwrap() = Some(block_0.header.clone());
         rpc.blocks_by_number
             .lock()
             .unwrap()
-            .insert(100, block_100.clone());
+            .insert(0, block_0.clone());
         rpc.headers_by_number
             .lock()
             .unwrap()
-            .insert(100, block_100.header.clone());
+            .insert(0, block_0.header.clone());
         rpc.headers_by_hash.lock().unwrap().insert(
-            format!("{:#x}", block_100.header.hash),
-            block_100.header.clone(),
+            format!("{:#x}", block_0.header.hash),
+            block_0.header.clone(),
         );
 
         let auditor = Auditor::new(rpc.clone(), cfg.clone());
@@ -3509,55 +4344,63 @@ mod tests {
             "only the explicit log file should be created"
         );
 
-        *rpc.tip.lock().unwrap() = Some(block_102.header.clone());
+        *rpc.tip.lock().unwrap() = Some(block_2.header.clone());
         rpc.blocks_by_number
             .lock()
             .unwrap()
-            .insert(101, block_101.clone());
+            .insert(1, block_1.clone());
         rpc.blocks_by_number
             .lock()
             .unwrap()
-            .insert(102, block_102.clone());
+            .insert(2, block_2.clone());
         rpc.headers_by_number
             .lock()
             .unwrap()
-            .insert(101, block_101.header.clone());
+            .insert(1, block_1.header.clone());
         rpc.headers_by_number
             .lock()
             .unwrap()
-            .insert(102, block_102.header.clone());
+            .insert(2, block_2.header.clone());
         rpc.headers_by_hash.lock().unwrap().insert(
-            format!("{:#x}", block_101.header.hash),
-            block_101.header.clone(),
+            format!("{:#x}", block_1.header.hash),
+            block_1.header.clone(),
         );
         rpc.headers_by_hash.lock().unwrap().insert(
-            format!("{:#x}", block_102.header.hash),
-            block_102.header.clone(),
+            format!("{:#x}", block_2.header.hash),
+            block_2.header.clone(),
         );
 
         auditor.poll_once(&mut cursor).await.unwrap();
         auditor.poll_once(&mut cursor).await.unwrap();
         let lines = read_log_lines(&log_path);
         assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0]["block_height"], 100);
-        assert_eq!(lines[1]["block_height"], 101);
-        assert_eq!(lines[2]["block_height"], 102);
+        assert_eq!(lines[0]["block_height"], 0);
+        assert_eq!(lines[1]["block_height"], 1);
+        assert_eq!(lines[2]["block_height"], 2);
 
-        *rpc.tip.lock().unwrap() = Some(block_105.header.clone());
+        *rpc.tip.lock().unwrap() = Some(block_5.header.clone());
         rpc.blocks_by_number
             .lock()
             .unwrap()
-            .insert(105, block_105.clone());
+            .insert(5, block_5.clone());
         rpc.headers_by_number
             .lock()
             .unwrap()
-            .insert(105, block_105.header.clone());
+            .insert(4, block_4.header.clone());
+        rpc.headers_by_hash.lock().unwrap().insert(
+            format!("{:#x}", block_4.header.hash),
+            block_4.header.clone(),
+        );
+        rpc.headers_by_number
+            .lock()
+            .unwrap()
+            .insert(5, block_5.header.clone());
         let restarted = Auditor::new(rpc, cfg);
         let mut restart_cursor = None;
         restarted.poll_once(&mut restart_cursor).await.unwrap();
         let lines = read_log_lines(&log_path);
         assert_eq!(lines.len(), 4);
-        assert_eq!(lines[3]["block_height"], 105);
+        assert_eq!(lines[3]["block_height"], 5);
     }
 
     #[tokio::test]
@@ -3598,6 +4441,8 @@ mod tests {
             genesis_hash: Some(format!("{:#x}", H256::from([1u8; 32]))),
             last_height: 9,
             last_hash: format!("{:#x}", H256::from([9u8; 32])),
+            next_height: None,
+            next_hash: None,
             history: BTreeMap::from([(9, format!("{:#x}", H256::from([9u8; 32])))]),
         };
         existing.save(&cursor_path).await.unwrap();
@@ -4013,21 +4858,448 @@ mod tests {
         let auditor = Auditor::new(rpc, cfg);
         let log = auditor.audit_block(&block_json).await;
         let serialized = serde_json::to_value(&log).unwrap();
-        assert_eq!(log.check_input_content_resolution, CheckStatus::Unknown);
-        assert_eq!(log.check_input_output_index, CheckStatus::Unknown);
-        assert_eq!(
-            log.check_ordinary_capacity_conservation,
-            CheckStatus::Unknown
-        );
-        assert_eq!(log.check_dao_withdraw_capacity, CheckStatus::Unknown);
+        assert_eq!(log.check_input_content_resolution, CheckStatus::Fail);
+        assert_eq!(log.check_input_output_index, CheckStatus::Fail);
+        assert_eq!(log.check_ordinary_capacity_conservation, CheckStatus::Fail);
+        assert_eq!(log.check_dao_withdraw_capacity, CheckStatus::Fail);
         assert!(serialized.get("check_dao_withdraw_capacity").is_some());
+        assert!(serialized.get("coverage").is_none());
+        assert!(serialized.get("unknown_checks").is_none());
         assert!(
-            log.details
-                .as_ref()
+            log.failed_checks.as_ref().is_some_and(
+                |checks| checks.contains(&"check_input_content_resolution".to_string())
+            )
+        );
+        assert!(log.details.as_ref().unwrap().iter().any(|detail| {
+            detail.referenced_out_point.as_deref().is_some()
+                && detail.failure_kind == Some(FailureKind::RetryExhausted)
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_required_null_retry_recovers_to_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().join("cursor.json"));
+        cfg.max_retries = 1;
+
+        let parent_block = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(1u64)
+                    .timestamp(1000u64)
+                    .epoch(EpochNumberWithFraction::new(0, 1, 1000).full_value())
+                    .build(),
+            )
+            .transaction(empty_cellbase(1))
+            .build();
+        let prev_tx = TransactionBuilder::default()
+            .version(0u32)
+            .output(simple_cell_output(10_000_000_000))
+            .output_data(ckb_types::bytes::Bytes::new())
+            .build();
+        let spend_tx = TransactionBuilder::default()
+            .version(0u32)
+            .input(CellInput::new(PackedOutPoint::new(prev_tx.hash(), 0), 0))
+            .output(simple_cell_output(10_000_000_000))
+            .output_data(ckb_types::bytes::Bytes::new())
+            .build();
+        let block = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(2u64)
+                    .timestamp(1200u64)
+                    .epoch(EpochNumberWithFraction::new(0, 2, 1000).full_value())
+                    .parent_hash(parent_block.header().hash())
+                    .build(),
+            )
+            .transaction(empty_cellbase(2))
+            .transaction(spend_tx.clone())
+            .build();
+        let block_json: BlockView = block.clone().into();
+        let parent_json: HeaderView = parent_block.header().to_owned().into();
+
+        let rpc = Arc::new(RetryRpc::default());
+        *rpc.base.consensus.lock().unwrap() = Some(mock_consensus());
+        rpc.base
+            .headers_by_hash
+            .lock()
+            .unwrap()
+            .insert(format!("{:#x}", parent_json.hash), parent_json.clone());
+        rpc.base
+            .headers_by_number
+            .lock()
+            .unwrap()
+            .insert(1, parent_json);
+        rpc.base
+            .headers_by_number
+            .lock()
+            .unwrap()
+            .insert(2, block_json.header.clone());
+        rpc.base
+            .blocks_by_number
+            .lock()
+            .unwrap()
+            .insert(2, block_json.clone());
+        rpc.queue_tx_sequence(
+            &prev_tx.hash().unpack(),
+            vec![
+                None,
+                Some(
+                    serde_json::to_value(committed_tx_response(
+                        &prev_tx,
+                        parent_block.header().hash().unpack(),
+                    ))
+                    .unwrap(),
+                ),
+            ],
+        );
+
+        let auditor = Auditor::new(rpc.clone(), cfg.clone());
+        let consensus = ConsensusSnapshot::from_rpc(&cfg, mock_consensus()).unwrap();
+        let (_, log, completed) = auditor
+            .audit_height_with_retries(2, &consensus)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(completed);
+        assert_eq!(log.result, AuditResult::Pass);
+        assert!(log.failed_checks.is_none());
+        assert!(log.details.is_none());
+        assert_eq!(rpc.tx_calls(&prev_tx.hash().unpack()), 2);
+        let value = serde_json::to_value(&log).unwrap();
+        assert!(value.get("coverage").is_none());
+        assert!(value.get("unknown_checks").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_no_cursor_mode_keeps_retrying_failed_tip_when_tip_advances() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("audit.log");
+        let mut cfg = test_config(dir.path().join("cursor.json"));
+        cfg.cursor_path = None;
+        cfg.log_path = Some(log_path.clone());
+        cfg.max_retries = 1;
+
+        let parent_block = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(1u64)
+                    .timestamp(1000u64)
+                    .epoch(EpochNumberWithFraction::new(0, 1, 1000).full_value())
+                    .build(),
+            )
+            .transaction(empty_cellbase(1))
+            .build();
+        let prev_tx = TransactionBuilder::default()
+            .version(0u32)
+            .output(simple_cell_output(10_000_000_000))
+            .output_data(ckb_types::bytes::Bytes::new())
+            .build();
+        let spend_tx = TransactionBuilder::default()
+            .version(0u32)
+            .input(CellInput::new(PackedOutPoint::new(prev_tx.hash(), 0), 0))
+            .output(simple_cell_output(10_000_000_000))
+            .output_data(ckb_types::bytes::Bytes::new())
+            .build();
+        let block_2 = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(2u64)
+                    .timestamp(1200u64)
+                    .epoch(EpochNumberWithFraction::new(0, 2, 1000).full_value())
+                    .parent_hash(parent_block.header().hash())
+                    .build(),
+            )
+            .transaction(empty_cellbase(2))
+            .transaction(spend_tx.clone())
+            .build();
+        let block_3 = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(3u64)
+                    .timestamp(1300u64)
+                    .epoch(EpochNumberWithFraction::new(0, 3, 1000).full_value())
+                    .parent_hash(block_2.header().hash())
+                    .build(),
+            )
+            .transaction(empty_cellbase(3))
+            .build();
+        let block_2_json: BlockView = block_2.clone().into();
+        let block_3_json: BlockView = block_3.into();
+        let parent_json: HeaderView = parent_block.header().to_owned().into();
+
+        let rpc = Arc::new(RetryRpc::default());
+        *rpc.base.consensus.lock().unwrap() = Some(mock_consensus());
+        *rpc.base.tip.lock().unwrap() = Some(block_2_json.header.clone());
+        rpc.base
+            .headers_by_hash
+            .lock()
+            .unwrap()
+            .insert(format!("{:#x}", parent_json.hash), parent_json.clone());
+        rpc.base
+            .headers_by_number
+            .lock()
+            .unwrap()
+            .insert(1, parent_json);
+        rpc.base
+            .headers_by_number
+            .lock()
+            .unwrap()
+            .insert(2, block_2_json.header.clone());
+        rpc.base
+            .headers_by_number
+            .lock()
+            .unwrap()
+            .insert(3, block_3_json.header.clone());
+        rpc.base
+            .blocks_by_number
+            .lock()
+            .unwrap()
+            .insert(2, block_2_json.clone());
+        rpc.base
+            .blocks_by_number
+            .lock()
+            .unwrap()
+            .insert(3, block_3_json.clone());
+        rpc.queue_tx_sequence(&prev_tx.hash().unpack(), vec![None, None, None, None]);
+
+        let auditor = Auditor::new(rpc.clone(), cfg);
+        let mut cursor = None;
+        auditor.poll_once(&mut cursor).await.unwrap();
+        let pending = cursor.as_ref().unwrap();
+        assert_eq!(pending.last_height, 1);
+        assert_eq!(pending.next_height, Some(2));
+
+        *rpc.base.tip.lock().unwrap() = Some(block_3_json.header.clone());
+        auditor.poll_once(&mut cursor).await.unwrap();
+
+        let lines = read_log_lines(&log_path);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["block_height"], 2);
+        assert_eq!(lines[1]["block_height"], 2);
+        assert_eq!(lines[0]["result"], "FAIL");
+        assert_eq!(lines[1]["result"], "FAIL");
+        assert!(
+            lines[0]["details"]
+                .as_array()
                 .unwrap()
                 .iter()
-                .any(|detail| detail.referenced_out_point.as_deref().is_some())
+                .any(|detail| {
+                    detail["error_code"] == "INPUT_TX_MISSING"
+                        && detail["failure_kind"] == "RETRY_EXHAUSTED"
+                        && detail["rpc_method"] == "get_transaction"
+                        && detail["attempts"] == 2
+                        && detail["max_retries"] == 1
+                })
         );
+        assert!(!dir.path().join("cursor.json").exists());
+    }
+
+    #[tokio::test]
+    async fn test_persistent_cursor_retries_pending_height_after_restart_then_advances() {
+        let dir = tempfile::tempdir().unwrap();
+        let cursor_path = dir.path().join("cursor.json");
+        let log_path = dir.path().join("audit.log");
+        let mut cfg = test_config(cursor_path.clone());
+        cfg.log_path = Some(log_path.clone());
+        cfg.max_retries = 1;
+
+        let parent_block = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(1u64)
+                    .timestamp(1000u64)
+                    .epoch(EpochNumberWithFraction::new(0, 1, 1000).full_value())
+                    .build(),
+            )
+            .transaction(empty_cellbase(1))
+            .build();
+        let prev_tx = TransactionBuilder::default()
+            .version(0u32)
+            .output(simple_cell_output(10_000_000_000))
+            .output_data(ckb_types::bytes::Bytes::new())
+            .build();
+        let spend_tx = TransactionBuilder::default()
+            .version(0u32)
+            .input(CellInput::new(PackedOutPoint::new(prev_tx.hash(), 0), 0))
+            .output(simple_cell_output(10_000_000_000))
+            .output_data(ckb_types::bytes::Bytes::new())
+            .build();
+        let block_2 = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(2u64)
+                    .timestamp(1200u64)
+                    .epoch(EpochNumberWithFraction::new(0, 2, 1000).full_value())
+                    .parent_hash(parent_block.header().hash())
+                    .build(),
+            )
+            .transaction(empty_cellbase(2))
+            .transaction(spend_tx.clone())
+            .build();
+        let block_3 = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(3u64)
+                    .timestamp(1300u64)
+                    .epoch(EpochNumberWithFraction::new(0, 3, 1000).full_value())
+                    .parent_hash(block_2.header().hash())
+                    .build(),
+            )
+            .transaction(empty_cellbase(3))
+            .build();
+        let block_2_json: BlockView = block_2.clone().into();
+        let block_3_json: BlockView = block_3.clone().into();
+        let parent_json: HeaderView = parent_block.header().to_owned().into();
+
+        let rpc_fail = Arc::new(RetryRpc::default());
+        *rpc_fail.base.consensus.lock().unwrap() = Some(mock_consensus());
+        *rpc_fail.base.tip.lock().unwrap() = Some(block_2_json.header.clone());
+        rpc_fail
+            .base
+            .headers_by_hash
+            .lock()
+            .unwrap()
+            .insert(format!("{:#x}", parent_json.hash), parent_json.clone());
+        rpc_fail
+            .base
+            .headers_by_number
+            .lock()
+            .unwrap()
+            .insert(1, parent_json.clone());
+        rpc_fail
+            .base
+            .headers_by_number
+            .lock()
+            .unwrap()
+            .insert(2, block_2_json.header.clone());
+        rpc_fail.base.headers_by_hash.lock().unwrap().insert(
+            format!("{:#x}", block_2_json.header.hash),
+            block_2_json.header.clone(),
+        );
+        rpc_fail
+            .base
+            .blocks_by_number
+            .lock()
+            .unwrap()
+            .insert(2, block_2_json.clone());
+        rpc_fail.queue_tx_sequence(&prev_tx.hash().unpack(), vec![None, None]);
+
+        let auditor_fail = Auditor::new(rpc_fail, cfg.clone());
+        let mut cursor = None;
+        auditor_fail.poll_once(&mut cursor).await.unwrap();
+
+        let saved = CursorState::load(&cursor_path).await.unwrap().unwrap();
+        assert_eq!(saved.last_height, 1);
+        assert_eq!(saved.next_height, Some(2));
+
+        let rpc_recover = Arc::new(RetryRpc::default());
+        *rpc_recover.base.consensus.lock().unwrap() = Some(mock_consensus());
+        *rpc_recover.base.tip.lock().unwrap() = Some(block_3_json.header.clone());
+        rpc_recover
+            .base
+            .headers_by_hash
+            .lock()
+            .unwrap()
+            .insert(format!("{:#x}", parent_json.hash), parent_json);
+        rpc_recover
+            .base
+            .headers_by_number
+            .lock()
+            .unwrap()
+            .insert(1, parent_block.header().to_owned().into());
+        rpc_recover
+            .base
+            .headers_by_number
+            .lock()
+            .unwrap()
+            .insert(2, block_2_json.header.clone());
+        rpc_recover.base.headers_by_hash.lock().unwrap().insert(
+            format!("{:#x}", block_2_json.header.hash),
+            block_2_json.header.clone(),
+        );
+        rpc_recover
+            .base
+            .headers_by_number
+            .lock()
+            .unwrap()
+            .insert(3, block_3_json.header.clone());
+        rpc_recover
+            .base
+            .blocks_by_number
+            .lock()
+            .unwrap()
+            .insert(2, block_2_json.clone());
+        rpc_recover
+            .base
+            .blocks_by_number
+            .lock()
+            .unwrap()
+            .insert(3, block_3_json.clone());
+        rpc_recover.base.txs.lock().unwrap().insert(
+            format!("{:#x}", prev_tx.hash()),
+            serde_json::to_value(committed_tx_response(
+                &prev_tx,
+                parent_block.header().hash().unpack(),
+            ))
+            .unwrap(),
+        );
+
+        let auditor_recover = Auditor::new(rpc_recover, cfg);
+        let mut restarted_cursor = auditor_recover.load_cursor().await.unwrap();
+        auditor_recover
+            .poll_once(&mut restarted_cursor)
+            .await
+            .unwrap();
+
+        let lines = read_log_lines(&log_path);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0]["block_height"], 2);
+        assert_eq!(lines[1]["block_height"], 2);
+        assert_eq!(lines[2]["block_height"], 3);
+        assert_eq!(lines[0]["result"], "FAIL");
+        assert_eq!(lines[1]["result"], "PASS");
+        assert_eq!(lines[2]["result"], "PASS");
+        assert!(
+            lines[0]["details"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|detail| {
+                    detail["error_code"] == "INPUT_TX_MISSING"
+                        && detail["failure_kind"] == "RETRY_EXHAUSTED"
+                        && detail["attempts"] == 2
+                        && detail["max_retries"] == 1
+                })
+        );
+
+        let final_cursor = CursorState::load(&cursor_path).await.unwrap().unwrap();
+        assert_eq!(final_cursor.last_height, 3);
+        assert!(final_cursor.next_height.is_none());
+    }
+
+    #[test]
+    fn test_failed_checks_summary_survives_zero_max_details() {
+        let mut cfg = test_config(PathBuf::from("/tmp/cursor.json"));
+        cfg.max_details = 0;
+        let block = BlockBuilder::default()
+            .header(HeaderBuilder::default().number(0u64).build())
+            .build();
+        let block_json: BlockView = block.into();
+        let auditor = Auditor::new(Arc::new(MockRpc::default()), cfg.clone());
+        let mut log = AuditLog::new(&cfg, &block_json);
+        log.check_block_hash = CheckStatus::Fail;
+        log.check_timestamp = CheckStatus::Unknown;
+        auditor.backfill_anomaly_details(&mut log);
+        log.finalize(2, 1);
+
+        assert!(log.details_total.unwrap() >= 2);
+        assert_eq!(log.details.as_ref().unwrap().len(), 0);
+        let failed_checks = log.failed_checks.as_ref().unwrap();
+        assert!(failed_checks.contains(&"check_block_hash".to_string()));
+        assert!(failed_checks.contains(&"check_timestamp".to_string()));
+        assert_eq!(log.check_timestamp, CheckStatus::Fail);
     }
 
     #[test]
@@ -4039,18 +5311,21 @@ mod tests {
         let mut log = AuditLog::new(&test_config(PathBuf::from("/tmp/cursor.json")), &block_json);
         log.check_block_height = CheckStatus::Pass;
         log.check_cellbase_reward_amount = CheckStatus::Unknown;
-        log.finalize();
+        log.finalize(1, 0);
 
         let value = serde_json::to_value(&log).unwrap();
-        assert_eq!(value["schema_version"], 3);
+        assert_eq!(value["schema_version"], 4);
         assert!(value.get("check_block_height").is_some());
         assert!(value.get("check_cellbase_reward_amount").is_some());
         assert!(value.get("check_pow").is_none());
         assert!(value.get("check_dao_withdraw_capacity").is_none());
+        assert!(value.get("check_output_lock_hash_type").is_none());
         assert!(value.get("network").is_none());
         assert!(value.get("reward_target_block_hash").is_none());
         assert!(value.get("reward_verification_method").is_none());
-        assert!(value.get("failed_checks").is_none());
+        assert!(value.get("coverage").is_none());
+        assert!(value.get("unknown_checks").is_none());
+        assert_eq!(value["result"], "FAIL");
     }
 
     #[tokio::test]
@@ -4093,7 +5368,7 @@ mod tests {
             .audit_header_and_block(&block_json, &core_block, &mut log, Some(&fail_consensus))
             .await;
         auditor.backfill_anomaly_details(&mut log);
-        log.finalize();
+        log.finalize(1, cfg.max_retries);
 
         let failed_checks = log.failed_checks.as_ref().unwrap();
         assert!(failed_checks.contains(&"check_block_size".to_string()));
