@@ -28,6 +28,9 @@ use tokio_util::sync::CancellationToken;
 
 const RETRY_BASE_DELAY_MS: u64 = 100;
 const RATE_LIMIT_FALLBACK_DELAY_SECS: u64 = 60;
+const PENDING_LOG_REMINDER_ROUNDS: u32 = 10;
+const PENDING_EXECUTION_BACKOFF_FLOOR_SECS: u64 = 15;
+const PENDING_EXECUTION_BACKOFF_CAP_SECS: u64 = 300;
 
 #[derive(Debug, Clone)]
 pub struct AuditorConfig {
@@ -251,12 +254,151 @@ impl EmittedAuditWindow {
     }
 }
 
+#[derive(Debug, Default)]
+struct PendingAuditWindow {
+    entries: HashMap<String, PendingAuditState>,
+    order: VecDeque<String>,
+    limit: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PendingAuditState {
+    fingerprint: String,
+    first_seen: std::time::Duration,
+    last_logged: std::time::Duration,
+    rounds: u32,
+    repeats_since_change: u32,
+    next_retry_not_before: Option<std::time::Duration>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingAuditObservation {
+    rounds: u32,
+    repeats_since_change: u32,
+    first_seen: std::time::Duration,
+    should_log: bool,
+    reason_changed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PendingAuditRecovery {
+    rounds: u32,
+    first_seen: std::time::Duration,
+}
+
+impl PendingAuditWindow {
+    fn new(limit: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            limit: limit.max(1),
+        }
+    }
+
+    fn remember_key(&mut self, block_hash: &str) {
+        self.order.retain(|existing| existing != block_hash);
+        self.order.push_back(block_hash.to_string());
+        while self.order.len() > self.limit {
+            if let Some(evicted) = self.order.pop_front() {
+                self.entries.remove(&evicted);
+            }
+        }
+    }
+
+    fn next_retry_not_before(
+        &self,
+        block_hash: &str,
+        now: std::time::Duration,
+    ) -> Option<std::time::Duration> {
+        self.entries
+            .get(block_hash)
+            .and_then(|state| state.next_retry_not_before)
+            .filter(|deadline| *deadline > now)
+    }
+
+    fn next_round(&self, block_hash: &str) -> u32 {
+        self.entries
+            .get(block_hash)
+            .map(|state| state.rounds.saturating_add(1))
+            .unwrap_or(1)
+    }
+
+    fn observe_pending(
+        &mut self,
+        now: std::time::Duration,
+        block_hash: &str,
+        fingerprint: String,
+        next_retry_not_before: Option<std::time::Duration>,
+    ) -> PendingAuditObservation {
+        self.remember_key(block_hash);
+        let state = self
+            .entries
+            .entry(block_hash.to_string())
+            .or_insert_with(|| PendingAuditState {
+                fingerprint: fingerprint.clone(),
+                first_seen: now,
+                last_logged: now,
+                rounds: 0,
+                repeats_since_change: 0,
+                next_retry_not_before,
+            });
+        state.rounds = state.rounds.saturating_add(1);
+        state.next_retry_not_before = next_retry_not_before;
+
+        let reason_changed = state.fingerprint != fingerprint;
+        if reason_changed {
+            state.fingerprint = fingerprint;
+            state.repeats_since_change = 0;
+            state.last_logged = now;
+            return PendingAuditObservation {
+                rounds: state.rounds,
+                repeats_since_change: 0,
+                first_seen: state.first_seen,
+                should_log: true,
+                reason_changed: true,
+            };
+        }
+
+        let first_round = state.rounds == 1;
+        if !first_round {
+            state.repeats_since_change = state.repeats_since_change.saturating_add(1);
+        }
+        let should_log = first_round
+            || state
+                .repeats_since_change
+                .is_multiple_of(PENDING_LOG_REMINDER_ROUNDS);
+        if should_log {
+            state.last_logged = now;
+        }
+        PendingAuditObservation {
+            rounds: state.rounds,
+            repeats_since_change: state.repeats_since_change,
+            first_seen: state.first_seen,
+            should_log,
+            reason_changed: false,
+        }
+    }
+
+    fn resolve(&mut self, block_hash: &str) -> Option<PendingAuditRecovery> {
+        self.order.retain(|existing| existing != block_hash);
+        self.entries
+            .remove(block_hash)
+            .map(|state| PendingAuditRecovery {
+                rounds: state.rounds,
+                first_seen: state.first_seen,
+            })
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 struct RpcCooldownState {
     deadline: Option<std::time::Duration>,
     resume_at_utc: Option<DateTime<Utc>>,
     method: Option<String>,
     reason: Option<String>,
+    delay_source: Option<&'static str>,
+    wait_duration: Option<std::time::Duration>,
+    awaiting_recovery: Option<CooldownRecoveryState>,
 }
 
 enum HeightAuditOutcome {
@@ -269,7 +411,23 @@ enum HeightAuditOutcome {
         log: AuditLog,
         block_attempt: u32,
         total_block_attempts: u32,
+        non_retryable_execution: bool,
     },
+}
+
+#[derive(Debug, Clone)]
+struct CooldownRecoveryState {
+    method: String,
+    reason: String,
+    resume_at_utc: DateTime<Utc>,
+    delay_source: &'static str,
+    wait_duration: std::time::Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RetryDelayDecision {
+    delay: std::time::Duration,
+    source: &'static str,
 }
 
 #[async_trait]
@@ -437,6 +595,7 @@ impl ConsensusSnapshot {
 struct ResolvedCommittedTransaction {
     tx: TransactionView,
     block_hash: H256,
+    block_number: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -963,21 +1122,24 @@ impl HttpRpc {
                         let resume_at = state.resume_at_utc.take().unwrap_or_else(Utc::now);
                         let method = state.method.take().unwrap_or_else(|| "unknown".to_string());
                         let reason = state.reason.take().unwrap_or_default();
+                        let delay_source = state.delay_source.take().unwrap_or("fallback");
+                        let wait_duration = state.wait_duration.take().unwrap_or_default();
                         state.deadline = None;
-                        if reason.is_empty() {
-                            eprintln!(
-                                "rpc cooldown recovered after method={} next_try_at={}",
-                                method,
-                                resume_at.to_rfc3339_opts(SecondsFormat::Millis, true)
-                            );
-                        } else {
-                            eprintln!(
-                                "rpc cooldown recovered after method={} reason={} next_try_at={}",
-                                method,
-                                reason,
-                                resume_at.to_rfc3339_opts(SecondsFormat::Millis, true)
-                            );
-                        }
+                        eprintln!(
+                            "rpc cooldown expired/resuming trigger_method={} delay_source={} wait_ms={} next_try_at={}{}",
+                            method,
+                            delay_source,
+                            wait_duration.as_millis(),
+                            resume_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+                            format_reason_suffix(&reason)
+                        );
+                        state.awaiting_recovery = Some(CooldownRecoveryState {
+                            method,
+                            reason,
+                            resume_at_utc: resume_at,
+                            delay_source,
+                            wait_duration,
+                        });
                         None
                     }
                     None => None,
@@ -1002,37 +1164,58 @@ impl HttpRpc {
         &self,
         retry_after: Option<&reqwest::header::HeaderValue>,
         body: &str,
-    ) -> std::time::Duration {
-        retry_after
+    ) -> RetryDelayDecision {
+        if let Some(header_delay) = retry_after
             .and_then(|value| value.to_str().ok())
             .and_then(|value| parse_retry_after_value(value, self.clock.now_utc()))
-            .or_else(|| parse_retry_after_from_body(body))
-            .unwrap_or_else(|| std::time::Duration::from_secs(RATE_LIMIT_FALLBACK_DELAY_SECS))
+            .filter(|delay| !delay.is_zero())
+        {
+            return RetryDelayDecision {
+                delay: header_delay,
+                source: "retry_after_header",
+            };
+        }
+        if let Some(body_delay) = parse_retry_after_from_body(body).filter(|delay| !delay.is_zero())
+        {
+            return RetryDelayDecision {
+                delay: body_delay,
+                source: "response_body",
+            };
+        }
+        RetryDelayDecision {
+            delay: std::time::Duration::from_secs(RATE_LIMIT_FALLBACK_DELAY_SECS),
+            source: "fallback",
+        }
     }
 
-    fn record_cooldown(&self, method: &str, delay: std::time::Duration, reason: &str) {
+    fn record_cooldown(&self, method: &str, decision: RetryDelayDecision, reason: &str) {
         let now = self.clock.now();
-        let new_deadline = now + delay;
-        let resume_at_utc = chrono::Duration::from_std(delay)
+        let new_deadline = now + decision.delay;
+        let resume_at_utc = chrono::Duration::from_std(decision.delay)
             .ok()
             .map(|delta| self.clock.now_utc() + delta)
             .unwrap_or_else(|| self.clock.now_utc());
         let mut state = self.cooldown.lock().unwrap();
         let prior_deadline = state.deadline.filter(|deadline| *deadline > now);
+        state.awaiting_recovery = None;
         let should_extend = prior_deadline.is_some_and(|deadline| new_deadline > deadline);
         if prior_deadline.is_none() {
             eprintln!(
-                "rpc cooldown entered method={} http_status=429 reason={} next_try_at={}",
+                "rpc cooldown entered method={} http_status=429 delay_source={} wait_ms={} next_try_at={}{}",
                 method,
-                sanitize_rate_limit_reason(reason),
-                resume_at_utc.to_rfc3339_opts(SecondsFormat::Millis, true)
+                decision.source,
+                decision.delay.as_millis(),
+                resume_at_utc.to_rfc3339_opts(SecondsFormat::Millis, true),
+                format_reason_suffix(&sanitize_rate_limit_reason(reason))
             );
         } else if should_extend {
             eprintln!(
-                "rpc cooldown extended method={} http_status=429 reason={} next_try_at={}",
+                "rpc cooldown extended method={} http_status=429 delay_source={} wait_ms={} next_try_at={}{}",
                 method,
-                sanitize_rate_limit_reason(reason),
-                resume_at_utc.to_rfc3339_opts(SecondsFormat::Millis, true)
+                decision.source,
+                decision.delay.as_millis(),
+                resume_at_utc.to_rfc3339_opts(SecondsFormat::Millis, true),
+                format_reason_suffix(&sanitize_rate_limit_reason(reason))
             );
         }
         if prior_deadline.is_none() || should_extend {
@@ -1040,6 +1223,25 @@ impl HttpRpc {
             state.resume_at_utc = Some(resume_at_utc);
             state.method = Some(method.to_string());
             state.reason = Some(sanitize_rate_limit_reason(reason));
+            state.delay_source = Some(decision.source);
+            state.wait_duration = Some(decision.delay);
+        }
+    }
+
+    fn mark_cooldown_recovered(&self, success_method: &str) {
+        let recovered = self.cooldown.lock().unwrap().awaiting_recovery.take();
+        if let Some(recovered) = recovered {
+            eprintln!(
+                "rpc cooldown recovered after success_method={} trigger_method={} delay_source={} wait_ms={} next_try_at={}{}",
+                success_method,
+                recovered.method,
+                recovered.delay_source,
+                recovered.wait_duration.as_millis(),
+                recovered
+                    .resume_at_utc
+                    .to_rfc3339_opts(SecondsFormat::Millis, true),
+                format_reason_suffix(&recovered.reason)
+            );
         }
     }
 
@@ -1065,8 +1267,9 @@ impl HttpRpc {
                         let retry_after = resp.headers().get(RETRY_AFTER).cloned();
                         let body = resp.text().await.unwrap_or_default();
                         if status == StatusCode::TOO_MANY_REQUESTS {
-                            let delay = self.parse_retry_after_delay(retry_after.as_ref(), &body);
-                            self.record_cooldown(method, delay, &body);
+                            let decision =
+                                self.parse_retry_after_delay(retry_after.as_ref(), &body);
+                            self.record_cooldown(method, decision, &body);
                         }
                         last_err = Some(anyhow!(format_http_status_error(
                             method,
@@ -1099,6 +1302,7 @@ impl HttpRpc {
                         .get("result")
                         .ok_or_else(|| anyhow!("rpc {} missing result", method))?
                         .clone();
+                    self.mark_cooldown_recovered(method);
                     return serde_json::from_value(result)
                         .with_context(|| format!("rpc {method} result decode failed"));
                 }
@@ -1206,6 +1410,7 @@ pub struct Auditor<R: CkbRpc> {
     sink: LogSink,
     consensus_cache: tokio::sync::Mutex<Option<ConsensusSnapshot>>,
     emitted_audits: StdMutex<EmittedAuditWindow>,
+    pending_audits: StdMutex<PendingAuditWindow>,
     shutdown: CancellationToken,
     clock: Arc<dyn RpcClock>,
 }
@@ -1233,12 +1438,14 @@ impl<R: CkbRpc> Auditor<R> {
             .unwrap_or(LogSink::Stdout);
         let emitted_audits =
             EmittedAuditWindow::load(config.log_path.as_deref(), config.history_retention);
+        let pending_audits = PendingAuditWindow::new(config.history_retention);
         Self {
             rpc,
             config,
             sink,
             consensus_cache: tokio::sync::Mutex::new(None),
             emitted_audits: StdMutex::new(emitted_audits),
+            pending_audits: StdMutex::new(pending_audits),
             shutdown,
             clock,
         }
@@ -1297,12 +1504,56 @@ impl<R: CkbRpc> Auditor<R> {
         Ok(true)
     }
 
+    fn pending_backoff_for_round(&self, round: u32) -> std::time::Duration {
+        let floor_ms = self
+            .config
+            .poll_interval_ms
+            .max(PENDING_EXECUTION_BACKOFF_FLOOR_SECS.saturating_mul(1000));
+        let factor = 1u64 << round.saturating_sub(1).min(4);
+        std::time::Duration::from_millis(
+            floor_ms
+                .saturating_mul(factor)
+                .min(PENDING_EXECUTION_BACKOFF_CAP_SECS.saturating_mul(1000)),
+        )
+    }
+
+    fn should_wait_for_pending_retry(
+        &self,
+        block_hash: &str,
+        now: std::time::Duration,
+    ) -> Option<std::time::Duration> {
+        self.pending_audits
+            .lock()
+            .unwrap()
+            .next_retry_not_before(block_hash, now)
+    }
+
+    fn note_pending_recovery(&self, block: &BlockView) {
+        let block_hash = format!("{:#x}", block.header.hash);
+        let recovered = self.pending_audits.lock().unwrap().resolve(&block_hash);
+        if let Some(recovered) = recovered {
+            let elapsed_ms = self
+                .clock
+                .now()
+                .saturating_sub(recovered.first_seen)
+                .as_millis();
+            eprintln!(
+                "pending audit recovered height {} block {:#x}: rounds={} pending_for_ms={}",
+                block.header.inner.number.value(),
+                block.header.hash,
+                recovered.rounds,
+                elapsed_ms
+            );
+        }
+    }
+
     fn log_pending_audit(
         &self,
         block: &BlockView,
         log: &AuditLog,
         block_attempt: u32,
         total_block_attempts: u32,
+        non_retryable_execution: bool,
     ) {
         let mut diagnostic = log.clone();
         self.backfill_anomaly_details(&mut diagnostic);
@@ -1322,21 +1573,72 @@ impl<R: CkbRpc> Auditor<R> {
             .map(|details| {
                 details
                     .iter()
-                    .map(|detail| format!("{}:{}", detail.check_name, detail.error_code))
+                    .map(|detail| {
+                        let mut context = format!("{}:{}", detail.check_name, detail.error_code);
+                        if let Some(tx_hash) = &detail.tx_hash {
+                            context.push_str(&format!(" tx={tx_hash}"));
+                        }
+                        if let Some(input_index) = detail.input_index {
+                            context.push_str(&format!(" input_index={input_index}"));
+                        }
+                        if let Some(out_point) = &detail.referenced_out_point {
+                            context.push_str(&format!(" out_point={out_point}"));
+                        }
+                        if let Some(rpc_method) = &detail.rpc_method {
+                            context.push_str(&format!(" rpc_method={rpc_method}"));
+                        }
+                        let reason = sanitize_diagnostic_reason(&detail.reason);
+                        if !reason.is_empty() {
+                            context.push_str(&format!(" reason={reason}"));
+                        }
+                        context
+                    })
                     .take(6)
                     .collect::<Vec<_>>()
                     .join(", ")
             })
             .unwrap_or_default();
+        let fingerprint = format!("{failed:?}|{unresolved:?}|{summary}");
+        let now = self.clock.now();
+        let block_hash = format!("{:#x}", block.header.hash);
+        let mut pending = self.pending_audits.lock().unwrap();
+        let next_retry_not_before = non_retryable_execution
+            .then(|| now + self.pending_backoff_for_round(pending.next_round(&block_hash)));
+        let observation =
+            pending.observe_pending(now, &block_hash, fingerprint, next_retry_not_before);
+        drop(pending);
+        if !observation.should_log {
+            return;
+        }
+        let pending_for_ms = now.saturating_sub(observation.first_seen).as_millis();
+        let next_retry_suffix = next_retry_not_before
+            .map(|deadline| {
+                format!(
+                    " next_retry_in_ms={}",
+                    deadline.saturating_sub(now).as_millis()
+                )
+            })
+            .unwrap_or_default();
+        let repeat_suffix = if observation.reason_changed {
+            " reason_changed=true".to_string()
+        } else if observation.repeats_since_change > 0 {
+            format!(" repeat_count={}", observation.repeats_since_change)
+        } else {
+            String::new()
+        };
         eprintln!(
-            "pending audit height {} block {:#x}: block_attempt {}/{} failed_checks={:?} unresolved_checks={:?} diagnostics=[{}]",
+            "pending audit height {} block {:#x}: audit_round={} block_attempt {}/{} pending_for_ms={} failed_checks={:?} unresolved_checks={:?} diagnostics=[{}]{}{}",
             block.header.inner.number.value(),
             block.header.hash,
+            observation.rounds,
             block_attempt,
             total_block_attempts,
+            pending_for_ms,
             failed,
             unresolved,
-            summary
+            summary,
+            repeat_suffix,
+            next_retry_suffix
         );
     }
 
@@ -1423,22 +1725,39 @@ impl<R: CkbRpc> Auditor<R> {
                     .then(|| state.next_hash.clone())
                     .flatten()
             });
+            if let Some(saved_hash) = pending_hash.as_deref()
+                && let Some(_next_retry_at) =
+                    self.should_wait_for_pending_retry(saved_hash, self.clock.now())
+            {
+                break;
+            }
             let Some(outcome) = self.audit_height_with_retries(height, &consensus).await? else {
                 break;
             };
-            let (block, log, completed, block_attempt, total_block_attempts) = match outcome {
-                HeightAuditOutcome::Finalized { block, log } => (block, log, true, None, None),
+            let (
+                block,
+                log,
+                completed,
+                block_attempt,
+                total_block_attempts,
+                non_retryable_execution,
+            ) = match outcome {
+                HeightAuditOutcome::Finalized { block, log } => {
+                    (block, log, true, None, None, false)
+                }
                 HeightAuditOutcome::Pending {
                     block,
                     log,
                     block_attempt,
                     total_block_attempts,
+                    non_retryable_execution,
                 } => (
                     block,
                     log,
                     false,
                     Some(block_attempt),
                     Some(total_block_attempts),
+                    non_retryable_execution,
                 ),
             };
             let hash = format!("{:#x}", block.header.hash);
@@ -1454,6 +1773,7 @@ impl<R: CkbRpc> Auditor<R> {
                 );
             }
             if completed {
+                self.note_pending_recovery(&block);
                 self.write_final_audit_once(&log)?;
                 if let Some(state) = cursor.as_mut() {
                     state.push_block(height, hash, self.config.history_retention);
@@ -1475,6 +1795,7 @@ impl<R: CkbRpc> Auditor<R> {
                     &log,
                     block_attempt.unwrap_or(1),
                     total_block_attempts.unwrap_or(self.config.max_retries.saturating_add(1)),
+                    non_retryable_execution,
                 );
                 if let Some(state) = cursor.as_mut() {
                     state.mark_pending(&block, self.config.history_retention);
@@ -1576,6 +1897,7 @@ impl<R: CkbRpc> Auditor<R> {
                     log,
                     block_attempt: attempt,
                     total_block_attempts: total_attempts,
+                    non_retryable_execution: false,
                 }));
             }
             if !non_retryable && attempt < total_attempts {
@@ -1587,6 +1909,7 @@ impl<R: CkbRpc> Auditor<R> {
                 log,
                 block_attempt: attempt,
                 total_block_attempts: total_attempts,
+                non_retryable_execution: non_retryable,
             }));
         }
         unreachable!("retry loop must return before exhaustion")
@@ -2777,18 +3100,19 @@ impl<R: CkbRpc> Auditor<R> {
     async fn fetch_committed_transaction(&self, hash: &H256) -> CachedTransaction {
         match self.rpc.get_transaction(hash).await {
             Ok(Some(resp)) => {
-                if resp.tx_status.status != Status::Committed {
+                let tx_status = resp.tx_status.clone();
+                if tx_status.status != Status::Committed {
                     return CachedTransaction::Unavailable(ResolutionIssue {
                         status: CheckStatus::Unknown,
                         error_code: "INPUT_TX_NOT_COMMITTED".to_string(),
                         reason: format!(
                             "get_transaction returned non-committed status {:?}",
-                            resp.tx_status.status
+                            tx_status.status
                         ),
                     });
                 }
 
-                let Some(block_hash) = resp.tx_status.block_hash else {
+                let Some(block_hash) = tx_status.block_hash else {
                     return CachedTransaction::Unavailable(ResolutionIssue {
                         status: CheckStatus::Unknown,
                         error_code: "INPUT_TX_BLOCK_HASH_MISSING".to_string(),
@@ -2826,7 +3150,11 @@ impl<R: CkbRpc> Auditor<R> {
                     });
                 }
 
-                CachedTransaction::Resolved(ResolvedCommittedTransaction { tx, block_hash })
+                CachedTransaction::Resolved(ResolvedCommittedTransaction {
+                    tx,
+                    block_hash,
+                    block_number: tx_status.block_number.map(|number| number.value()),
+                })
             }
             Ok(None) => CachedTransaction::Unavailable(ResolutionIssue {
                 status: CheckStatus::Unknown,
@@ -2887,11 +3215,171 @@ impl<R: CkbRpc> Auditor<R> {
         })
     }
 
+    fn decode_dao_block_number(
+        data: &ckb_jsonrpc_types::JsonBytes,
+        error_code: &str,
+        context: &str,
+    ) -> std::result::Result<u64, ResolutionIssue> {
+        let raw = data.as_bytes();
+        if raw.len() != 8 {
+            return Err(ResolutionIssue {
+                status: CheckStatus::Fail,
+                error_code: error_code.to_string(),
+                reason: format!("{context} must be exactly 8 bytes, got {}", raw.len()),
+            });
+        }
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(raw.as_ref());
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn extract_dao_deposit_header_hash(
+        current_tx: &TransactionView,
+        input_index: usize,
+    ) -> std::result::Result<H256, ResolutionIssue> {
+        let Some(witness) = current_tx.inner.witnesses.get(input_index) else {
+            return Err(ResolutionIssue {
+                status: CheckStatus::Fail,
+                error_code: "DAO_DEPOSIT_HEADER_INDEX_MISSING".to_string(),
+                reason: format!(
+                    "dao withdrawing input {} is missing its witness",
+                    input_index
+                ),
+            });
+        };
+        let witness_args =
+            packed::WitnessArgs::from_slice(witness.as_bytes()).map_err(|_| ResolutionIssue {
+                status: CheckStatus::Fail,
+                error_code: "DAO_WITNESS_INVALID".to_string(),
+                reason: format!(
+                    "dao withdrawing input {} witness cannot be decoded as WitnessArgs",
+                    input_index
+                ),
+            })?;
+        let input_type = witness_args
+            .input_type()
+            .to_opt()
+            .ok_or_else(|| ResolutionIssue {
+                status: CheckStatus::Fail,
+                error_code: "DAO_DEPOSIT_HEADER_INDEX_MISSING".to_string(),
+                reason: format!(
+                    "dao withdrawing input {} witness is missing input_type deposit header index",
+                    input_index
+                ),
+            })?;
+        let raw = input_type.raw_data();
+        if raw.len() != 8 {
+            return Err(ResolutionIssue {
+                status: CheckStatus::Fail,
+                error_code: "DAO_DEPOSIT_HEADER_INDEX_INVALID".to_string(),
+                reason: format!(
+                    "dao withdrawing input {} witness input_type must be exactly 8 bytes, got {}",
+                    input_index,
+                    raw.len()
+                ),
+            });
+        }
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(raw.as_ref());
+        let header_dep_index =
+            usize::try_from(u64::from_le_bytes(bytes)).map_err(|_| ResolutionIssue {
+                status: CheckStatus::Fail,
+                error_code: "DAO_DEPOSIT_HEADER_INDEX_INVALID".to_string(),
+                reason: format!(
+                    "dao withdrawing input {} witness input_type index exceeds platform usize",
+                    input_index
+                ),
+            })?;
+        current_tx
+            .inner
+            .header_deps
+            .get(header_dep_index)
+            .cloned()
+            .ok_or_else(|| ResolutionIssue {
+                status: CheckStatus::Fail,
+                error_code: "DAO_DEPOSIT_HEADER_REFERENCE_MISSING".to_string(),
+                reason: format!(
+                    "dao withdrawing input {} references header_dep index {} but only {} header_deps exist",
+                    input_index,
+                    header_dep_index,
+                    current_tx.inner.header_deps.len()
+                ),
+            })
+    }
+
+    fn validate_dao_withdrawing_output(
+        &self,
+        consensus: &ConsensusSnapshot,
+        current_tx: &TransactionView,
+        input_index: usize,
+        input_capacity: u64,
+        deposited_block_number: u64,
+    ) -> std::result::Result<(), ResolutionIssue> {
+        let Some(output) = current_tx.inner.outputs.get(input_index) else {
+            return Err(ResolutionIssue {
+                status: CheckStatus::Fail,
+                error_code: "DAO_WITHDRAWING_OUTPUT_MISSING".to_string(),
+                reason: format!(
+                    "dao deposit input {} requires a same-index withdrawing output",
+                    input_index
+                ),
+            });
+        };
+        if !Self::output_uses_dao_type(output, consensus) {
+            return Err(ResolutionIssue {
+                status: CheckStatus::Fail,
+                error_code: "DAO_WITHDRAWING_OUTPUT_TYPE_INVALID".to_string(),
+                reason: format!(
+                    "dao deposit input {} requires a same-index DAO type output",
+                    input_index
+                ),
+            });
+        }
+        if output.capacity.value() != input_capacity {
+            return Err(ResolutionIssue {
+                status: CheckStatus::Fail,
+                error_code: "DAO_WITHDRAWING_OUTPUT_CAPACITY_MISMATCH".to_string(),
+                reason: format!(
+                    "dao withdrawing output {} capacity {} does not match deposited input capacity {}",
+                    input_index,
+                    output.capacity.value(),
+                    input_capacity
+                ),
+            });
+        }
+        let Some(output_data) = current_tx.inner.outputs_data.get(input_index) else {
+            return Err(ResolutionIssue {
+                status: CheckStatus::Fail,
+                error_code: "DAO_WITHDRAWING_OUTPUT_DATA_MISSING".to_string(),
+                reason: format!(
+                    "dao withdrawing output {} is missing 8-byte deposited block number data",
+                    input_index
+                ),
+            });
+        };
+        let stored_block_number = Self::decode_dao_block_number(
+            output_data,
+            "DAO_WITHDRAWING_OUTPUT_DATA_INVALID",
+            "dao withdrawing output data",
+        )?;
+        if stored_block_number != deposited_block_number {
+            return Err(ResolutionIssue {
+                status: CheckStatus::Fail,
+                error_code: "DAO_WITHDRAWING_OUTPUT_BLOCK_NUMBER_MISMATCH".to_string(),
+                reason: format!(
+                    "dao withdrawing output {} stores deposited block number {}, expected {}",
+                    input_index, stored_block_number, deposited_block_number
+                ),
+            });
+        }
+        Ok(())
+    }
+
     async fn resolve_dao_input_capacity(
         &self,
         consensus: &ConsensusSnapshot,
         current_tx: &TransactionView,
-        input: &ckb_jsonrpc_types::CellInput,
+        input_index: usize,
         source: &ResolvedCommittedTransaction,
         source_output_index: usize,
     ) -> std::result::Result<u128, ResolutionIssue> {
@@ -2905,45 +3393,86 @@ impl<R: CkbRpc> Auditor<R> {
                 ),
             });
         };
-        let (deposit_out_point, calculation_kind) = if source_data
-            .as_bytes()
-            .iter()
-            .all(|byte| *byte == 0)
-        {
-            let Some(withdrawing_header_hash) = current_tx.inner.header_deps.last().cloned() else {
-                return Err(ResolutionIssue {
-                    status: CheckStatus::Unknown,
-                    error_code: "DAO_WITHDRAW_HEADER_MISSING".to_string(),
-                    reason: "dao deposit input cannot be verified without a withdrawing header reference"
-                        .to_string(),
-                });
-            };
-            (
-                input.previous_output.clone(),
-                DaoWithdrawingCalculationKind::WithdrawingHeaderHash(withdrawing_header_hash),
-            )
-        } else {
-            let deposit_out_point = if source.tx.inner.inputs.len() == 1 {
-                source.tx.inner.inputs[0].previous_output.clone()
-            } else if source_output_index < source.tx.inner.inputs.len() {
-                source.tx.inner.inputs[source_output_index]
-                    .previous_output
-                    .clone()
-            } else {
-                return Err(ResolutionIssue {
-                    status: CheckStatus::Unknown,
-                    error_code: "DAO_DEPOSIT_REFERENCE_AMBIGUOUS".to_string(),
+        let deposited_block_number = Self::decode_dao_block_number(
+            source_data,
+            "DAO_INPUT_DATA_INVALID",
+            "dao input source data",
+        )?;
+        if deposited_block_number == 0 {
+            let deposited_input_capacity = source
+                .tx
+                .inner
+                .outputs
+                .get(source_output_index)
+                .map(|output| output.capacity.value())
+                .ok_or_else(|| ResolutionIssue {
+                    status: CheckStatus::Fail,
+                    error_code: "INPUT_TX_OUTPUT_MISSING".to_string(),
                     reason: format!(
-                        "cannot unambiguously trace deposit out point for withdrawing cell index {}",
+                        "source transaction output missing at index {}",
                         source_output_index
                     ),
-                });
-            };
-            (
-                deposit_out_point,
-                DaoWithdrawingCalculationKind::WithdrawingOutPoint(input.previous_output.clone()),
-            )
+                })?;
+            let source_block_number = source.block_number.ok_or_else(|| ResolutionIssue {
+                status: CheckStatus::Unknown,
+                error_code: "INPUT_TX_BLOCK_NUMBER_MISSING".to_string(),
+                reason: "committed source transaction response missing tx_status.block_number"
+                    .to_string(),
+            })?;
+            self.validate_dao_withdrawing_output(
+                consensus,
+                current_tx,
+                input_index,
+                deposited_input_capacity,
+                source_block_number,
+            )?;
+            return Ok(u128::from(deposited_input_capacity));
+        }
+
+        let deposit_header_hash = Self::extract_dao_deposit_header_hash(current_tx, input_index)?;
+        let deposit_header = self
+            .rpc
+            .get_header(&deposit_header_hash)
+            .await
+            .map_err(|err| ResolutionIssue {
+                status: CheckStatus::Unknown,
+                error_code: "DAO_DEPOSIT_HEADER_RPC_ERROR".to_string(),
+                reason: format!(
+                    "get_header failed for deposit header {deposit_header_hash:#x}: {err}"
+                ),
+            })?
+            .ok_or_else(|| ResolutionIssue {
+                status: CheckStatus::Unknown,
+                error_code: "DAO_DEPOSIT_HEADER_MISSING".to_string(),
+                reason: format!(
+                    "get_header returned null for deposit header {deposit_header_hash:#x}"
+                ),
+            })?;
+        if deposit_header.inner.number.value() != deposited_block_number {
+            return Err(ResolutionIssue {
+                status: CheckStatus::Fail,
+                error_code: "DAO_DEPOSIT_HEADER_BLOCK_NUMBER_MISMATCH".to_string(),
+                reason: format!(
+                    "dao withdrawing input {} stores deposited block number {}, but referenced header_dep {deposit_header_hash:#x} is block {}",
+                    input_index,
+                    deposited_block_number,
+                    deposit_header.inner.number.value()
+                ),
+            });
+        }
+        let Some(deposit_input) = source.tx.inner.inputs.get(source_output_index) else {
+            return Err(ResolutionIssue {
+                status: CheckStatus::Fail,
+                error_code: "DAO_DEPOSIT_REFERENCE_MISSING".to_string(),
+                reason: format!(
+                    "dao withdrawing source transaction is missing the same-index deposit input {}",
+                    source_output_index
+                ),
+            });
         };
+        let deposit_out_point = deposit_input.previous_output.clone();
+        let calculation_kind =
+            DaoWithdrawingCalculationKind::WithdrawingHeaderHash(source.block_hash.clone());
 
         match self
             .rpc
@@ -3436,7 +3965,7 @@ impl<R: CkbRpc> Auditor<R> {
                         .resolve_dao_input_capacity(
                             consensus.expect("consensus checked above"),
                             tx,
-                            input,
+                            input_index,
                             &resolved,
                             idx,
                         )
@@ -4108,6 +4637,24 @@ fn sanitize_rate_limit_reason(reason: &str) -> String {
         .collect()
 }
 
+fn sanitize_diagnostic_reason(reason: &str) -> String {
+    reason
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(320)
+        .collect()
+}
+
+fn format_reason_suffix(reason: &str) -> String {
+    if reason.is_empty() {
+        String::new()
+    } else {
+        format!(" reason={reason}")
+    }
+}
+
 fn format_http_status_error(
     method: &str,
     status: StatusCode,
@@ -4167,12 +4714,15 @@ fn is_retryable_execution_error(error_code: &str) -> bool {
             | "INPUT_TX_JSON_MISSING"
             | "INPUT_TX_MISSING"
             | "INPUT_TX_RPC_ERROR"
+            | "INPUT_TX_BLOCK_NUMBER_MISSING"
             | "INPUT_INDEX_UNVERIFIED"
             | "INPUT_SOURCE_BLOCK_HASH_ZERO"
             | "ORDINARY_CAPACITY_CLASSIFICATION_UNKNOWN"
             | "ORDINARY_CAPACITY_INCOMPLETE"
             | "DAO_WITHDRAW_CAPACITY_INCOMPLETE"
             | "DAO_CLASSIFICATION_UNKNOWN"
+            | "DAO_DEPOSIT_HEADER_MISSING"
+            | "DAO_DEPOSIT_HEADER_RPC_ERROR"
             | "REWARD_TARGET_HEADER_MISSING"
             | "REWARD_TARGET_HEADER_RPC_ERROR"
             | "REWARD_FINALIZATION_MISMATCH"
@@ -4198,12 +4748,14 @@ fn is_block_retryable_execution_error(error_code: &str) -> bool {
             | "INPUT_TX_BLOCK_HASH_MISSING"
             | "INPUT_TX_JSON_MISSING"
             | "INPUT_TX_MISSING"
+            | "INPUT_TX_BLOCK_NUMBER_MISSING"
             | "INPUT_INDEX_UNVERIFIED"
             | "INPUT_SOURCE_BLOCK_HASH_ZERO"
             | "ORDINARY_CAPACITY_CLASSIFICATION_UNKNOWN"
             | "ORDINARY_CAPACITY_INCOMPLETE"
             | "DAO_WITHDRAW_CAPACITY_INCOMPLETE"
             | "DAO_CLASSIFICATION_UNKNOWN"
+            | "DAO_DEPOSIT_HEADER_MISSING"
             | "REWARD_TARGET_HEADER_MISSING"
             | "REWARD_FINALIZATION_MISMATCH"
             | "REWARD_TARGET_BLOCK_MISMATCH"
@@ -4225,8 +4777,10 @@ fn rpc_method_for_error_code(error_code: &str) -> Option<&'static str> {
         | "INPUT_TX_JSON_MISSING"
         | "INPUT_TX_MISSING"
         | "INPUT_TX_RPC_ERROR"
+        | "INPUT_TX_BLOCK_NUMBER_MISSING"
         | "INPUT_INDEX_UNVERIFIED"
         | "INPUT_SOURCE_BLOCK_HASH_ZERO" => Some("get_transaction"),
+        "DAO_DEPOSIT_HEADER_MISSING" | "DAO_DEPOSIT_HEADER_RPC_ERROR" => Some("get_header"),
         "REWARD_TARGET_HEADER_MISSING" | "REWARD_TARGET_HEADER_RPC_ERROR" => {
             Some("get_header_by_number")
         }
@@ -4306,6 +4860,8 @@ mod tests {
         txs: Mutex<HashMap<String, serde_json::Value>>,
         economics: Mutex<HashMap<String, BlockEconomicState>>,
         dao_max: Mutex<HashMap<String, Uint64>>,
+        dao_errors: Mutex<HashMap<String, String>>,
+        dao_calls: Mutex<Vec<(String, String)>>,
         consensus: Mutex<Option<RpcConsensus>>,
     }
 
@@ -4424,18 +4980,27 @@ mod tests {
         async fn calculate_dao_maximum_withdraw(
             &self,
             out_point: OutPoint,
-            _kind: DaoWithdrawingCalculationKind,
+            kind: DaoWithdrawingCalculationKind,
         ) -> Result<Option<Uint64>> {
-            Ok(self
-                .dao_max
-                .lock()
-                .unwrap()
-                .get(&format!(
-                    "{:#x}:{}",
+            let out_point_key = format!("{:#x}:{}", out_point.tx_hash, out_point.index.value());
+            let kind_key = match &kind {
+                DaoWithdrawingCalculationKind::WithdrawingHeaderHash(hash) => {
+                    format!("header:{hash:#x}")
+                }
+                DaoWithdrawingCalculationKind::WithdrawingOutPoint(out_point) => format!(
+                    "out_point:{:#x}:{}",
                     out_point.tx_hash,
                     out_point.index.value()
-                ))
-                .cloned())
+                ),
+            };
+            self.dao_calls
+                .lock()
+                .unwrap()
+                .push((out_point_key.clone(), kind_key));
+            if let Some(err) = self.dao_errors.lock().unwrap().get(&out_point_key).cloned() {
+                return Err(anyhow!(err));
+            }
+            Ok(self.dao_max.lock().unwrap().get(&out_point_key).cloned())
         }
     }
 
@@ -4684,6 +5249,38 @@ mod tests {
             .lock(simple_lock_script())
             .type_(ScriptOpt::default())
             .build()
+    }
+
+    fn dao_type_script(consensus: &ConsensusSnapshot) -> ckb_types::packed::Script {
+        ckb_types::packed::Script::new_builder()
+            .code_hash(consensus.dao_type_hash.pack())
+            .hash_type(ckb_types::core::ScriptHashType::Type)
+            .args(ckb_types::bytes::Bytes::new())
+            .build()
+    }
+
+    fn dao_cell_output(consensus: &ConsensusSnapshot, cap: u64) -> CellOutput {
+        CellOutput::new_builder()
+            .capacity(cap)
+            .lock(simple_lock_script())
+            .type_(
+                ScriptOpt::new_builder()
+                    .set(Some(dao_type_script(consensus)))
+                    .build(),
+            )
+            .build()
+    }
+
+    fn le_u64_bytes(value: u64) -> ckb_types::bytes::Bytes {
+        value.to_le_bytes().to_vec().into()
+    }
+
+    fn witness_with_input_type_u64(value: u64) -> packed::Bytes {
+        packed::WitnessArgs::new_builder()
+            .input_type(packed::Bytes::from(value.to_le_bytes().to_vec()))
+            .build()
+            .as_bytes()
+            .pack()
     }
 
     fn empty_cellbase(block_number: u64) -> ckb_types::core::TransactionView {
@@ -5401,6 +5998,226 @@ mod tests {
         assert!(parse_retry_after_value("Mon, 14 Sep 2026 08:29:59 GMT", now).is_none());
     }
 
+    #[test]
+    fn test_retry_after_zero_header_uses_body_delay() {
+        let clock = Arc::new(ManualRpcClock::new(
+            DateTime::parse_from_rfc3339("2026-09-14T08:30:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        ));
+        let rpc = HttpRpc::new_for_test(
+            "http://127.0.0.1:8114".to_string(),
+            5,
+            0,
+            CancellationToken::new(),
+            clock,
+        )
+        .unwrap();
+        let decision = rpc.parse_retry_after_delay(
+            Some(&reqwest::header::HeaderValue::from_static("0")),
+            r#"{"error":{"message":"allowed qps exceeded: Too many requests (exceeds 2000), try again after 60s"}}"#,
+        );
+        assert_eq!(decision.source, "response_body");
+        assert_eq!(decision.delay, std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_retry_after_fallback_is_used_when_header_and_body_are_unusable() {
+        let clock = Arc::new(ManualRpcClock::new(
+            DateTime::parse_from_rfc3339("2026-09-14T08:30:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        ));
+        let rpc = HttpRpc::new_for_test(
+            "http://127.0.0.1:8114".to_string(),
+            5,
+            0,
+            CancellationToken::new(),
+            clock,
+        )
+        .unwrap();
+        let decision = rpc.parse_retry_after_delay(
+            Some(&reqwest::header::HeaderValue::from_static("bogus")),
+            r#"{"error":{"message":"rate limited"}}"#,
+        );
+        assert_eq!(decision.source, "fallback");
+        assert_eq!(
+            decision.delay,
+            std::time::Duration::from_secs(RATE_LIMIT_FALLBACK_DELAY_SECS)
+        );
+    }
+
+    #[test]
+    fn test_pending_audit_window_rate_limits_repeated_diagnostics() {
+        let mut window = PendingAuditWindow::new(4);
+        let first = window.observe_pending(
+            std::time::Duration::ZERO,
+            "0xabc",
+            "same".to_string(),
+            Some(std::time::Duration::from_secs(15)),
+        );
+        assert!(first.should_log);
+        assert_eq!(first.rounds, 1);
+        for round in 2..=10 {
+            let observation = window.observe_pending(
+                std::time::Duration::from_secs(round as u64),
+                "0xabc",
+                "same".to_string(),
+                Some(std::time::Duration::from_secs(15)),
+            );
+            assert!(
+                !observation.should_log,
+                "round {round} should be suppressed"
+            );
+        }
+        let reminder = window.observe_pending(
+            std::time::Duration::from_secs(11),
+            "0xabc",
+            "same".to_string(),
+            Some(std::time::Duration::from_secs(15)),
+        );
+        assert!(reminder.should_log);
+        assert_eq!(reminder.repeats_since_change, 10);
+        assert_eq!(
+            window.next_retry_not_before("0xabc", std::time::Duration::ZERO),
+            Some(std::time::Duration::from_secs(15))
+        );
+    }
+
+    #[test]
+    fn test_pending_audit_window_logs_reason_changes_and_recovers_once() {
+        let mut window = PendingAuditWindow::new(2);
+        let _ = window.observe_pending(
+            std::time::Duration::ZERO,
+            "0xabc",
+            "first".to_string(),
+            None,
+        );
+        let changed = window.observe_pending(
+            std::time::Duration::from_secs(1),
+            "0xabc",
+            "second".to_string(),
+            None,
+        );
+        assert!(changed.should_log);
+        assert!(changed.reason_changed);
+        let recovered = window.resolve("0xabc").unwrap();
+        assert_eq!(recovered.rounds, 2);
+        assert!(window.resolve("0xabc").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_non_retryable_pending_block_uses_in_memory_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().join("cursor.json"));
+        cfg.cursor_path = None;
+        cfg.max_retries = 0;
+        let consensus = ConsensusSnapshot::from_rpc(&cfg, mock_consensus()).unwrap();
+
+        let parent_block = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(1u64)
+                    .timestamp(1000u64)
+                    .epoch(EpochNumberWithFraction::new(0, 1, 1000).full_value())
+                    .build(),
+            )
+            .transaction(empty_cellbase(1))
+            .build();
+        let deposit_tx = TransactionBuilder::default()
+            .version(0u32)
+            .output(dao_cell_output(&consensus, 10_000_000_000))
+            .output_data(le_u64_bytes(0))
+            .build();
+        let withdrawing_tx = TransactionBuilder::default()
+            .version(0u32)
+            .input(CellInput::new(PackedOutPoint::new(deposit_tx.hash(), 0), 0))
+            .output(dao_cell_output(&consensus, 10_000_000_000))
+            .output_data(le_u64_bytes(1))
+            .build();
+        let final_tx = TransactionBuilder::default()
+            .version(0u32)
+            .header_dep(parent_block.header().hash())
+            .input(CellInput::new(
+                PackedOutPoint::new(withdrawing_tx.hash(), 0),
+                0,
+            ))
+            .witness(witness_with_input_type_u64(0))
+            .output(simple_cell_output(13_000_000_000))
+            .output_data(ckb_types::bytes::Bytes::new())
+            .build();
+        let block_2 = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(2u64)
+                    .timestamp(1200u64)
+                    .epoch(EpochNumberWithFraction::new(0, 2, 1000).full_value())
+                    .parent_hash(parent_block.header().hash())
+                    .build(),
+            )
+            .transaction(empty_cellbase(2))
+            .transaction(final_tx)
+            .build();
+        let block_2_json: BlockView = block_2.into();
+        let parent_json: HeaderView = parent_block.header().to_owned().into();
+
+        let rpc = Arc::new(MockRpc::default());
+        *rpc.consensus.lock().unwrap() = Some(mock_consensus());
+        *rpc.tip.lock().unwrap() = Some(block_2_json.header.clone());
+        rpc.headers_by_hash
+            .lock()
+            .unwrap()
+            .insert(format!("{:#x}", parent_json.hash), parent_json.clone());
+        rpc.headers_by_number
+            .lock()
+            .unwrap()
+            .insert(1, parent_json.clone());
+        rpc.headers_by_number
+            .lock()
+            .unwrap()
+            .insert(2, block_2_json.header.clone());
+        rpc.blocks_by_number
+            .lock()
+            .unwrap()
+            .insert(2, block_2_json.clone());
+        rpc.txs.lock().unwrap().insert(
+            format!("{:#x}", withdrawing_tx.hash()),
+            serde_json::to_value(committed_tx_response(
+                &withdrawing_tx,
+                parent_block.header().hash().unpack(),
+            ))
+            .unwrap(),
+        );
+        rpc.dao_errors.lock().unwrap().insert(
+            format!("{:#x}:{}", deposit_tx.hash(), 0),
+            "invalid params: malformed dao reference".to_string(),
+        );
+
+        let clock = Arc::new(ManualRpcClock::new(
+            DateTime::parse_from_rfc3339("2026-09-14T08:30:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        ));
+        let auditor = Auditor::new_with_dependencies(
+            rpc.clone(),
+            cfg,
+            CancellationToken::new(),
+            clock.clone(),
+        );
+        let mut cursor = None;
+        auditor.poll_once(&mut cursor).await.unwrap();
+        assert_eq!(rpc.dao_calls.lock().unwrap().len(), 1);
+
+        auditor.poll_once(&mut cursor).await.unwrap();
+        assert_eq!(rpc.dao_calls.lock().unwrap().len(), 1);
+
+        clock.advance(std::time::Duration::from_secs(
+            PENDING_EXECUTION_BACKOFF_FLOOR_SECS,
+        ));
+        auditor.poll_once(&mut cursor).await.unwrap();
+        assert_eq!(rpc.dao_calls.lock().unwrap().len(), 2);
+    }
+
     #[tokio::test]
     async fn test_http_429_cooldown_is_shared_across_clones_and_methods() {
         let header = HeaderBuilder::default()
@@ -5468,11 +6285,21 @@ mod tests {
             clock.clone(),
         )
         .unwrap();
-        rpc.record_cooldown("get_consensus", std::time::Duration::from_secs(60), "first");
+        rpc.record_cooldown(
+            "get_consensus",
+            RetryDelayDecision {
+                delay: std::time::Duration::from_secs(60),
+                source: "retry_after_header",
+            },
+            "first",
+        );
         clock.advance(std::time::Duration::from_secs(60));
         rpc.record_cooldown(
             "get_tip_header",
-            std::time::Duration::from_secs(120),
+            RetryDelayDecision {
+                delay: std::time::Duration::from_secs(120),
+                source: "response_body",
+            },
             "second",
         );
         let remaining = rpc
@@ -5512,6 +6339,315 @@ mod tests {
         assert!(is_shutdown_error(&cancelled));
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_resolve_dao_deposit_input_uses_original_capacity_without_rpc() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path().join("cursor.json"));
+        let consensus = ConsensusSnapshot::from_rpc(&cfg, mock_consensus()).unwrap();
+
+        let deposit_header = HeaderBuilder::default()
+            .number(42u64)
+            .epoch(EpochNumberWithFraction::new(0, 42, 1000).full_value())
+            .build();
+        let deposit_tx = TransactionBuilder::default()
+            .version(0u32)
+            .output(dao_cell_output(&consensus, 10_000_000_000))
+            .output_data(le_u64_bytes(0))
+            .build();
+        let current_tx = TransactionBuilder::default()
+            .version(0u32)
+            .input(CellInput::new(PackedOutPoint::new(deposit_tx.hash(), 0), 0))
+            .output(dao_cell_output(&consensus, 10_000_000_000))
+            .output_data(le_u64_bytes(42))
+            .build();
+
+        let rpc = Arc::new(MockRpc::default());
+        let auditor = Auditor::new(rpc.clone(), cfg);
+        let current_tx_json: TransactionView = current_tx.into();
+        let source = ResolvedCommittedTransaction {
+            tx: deposit_tx.into(),
+            block_hash: deposit_header.hash().unpack(),
+            block_number: Some(42),
+        };
+
+        let capacity = auditor
+            .resolve_dao_input_capacity(&consensus, &current_tx_json, 0, &source, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(capacity, 10_000_000_000);
+        assert!(rpc.dao_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_final_dao_withdraw_uses_witness_header_and_source_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path().join("cursor.json"));
+        let consensus = ConsensusSnapshot::from_rpc(&cfg, mock_consensus()).unwrap();
+
+        let deposit_header = HeaderBuilder::default()
+            .number(7u64)
+            .epoch(EpochNumberWithFraction::new(0, 7, 1000).full_value())
+            .build();
+        let unrelated_header = HeaderBuilder::default()
+            .number(70u64)
+            .epoch(EpochNumberWithFraction::new(0, 70, 1000).full_value())
+            .build();
+        let wrong_last_header = HeaderBuilder::default()
+            .number(99u64)
+            .epoch(EpochNumberWithFraction::new(0, 99, 1000).full_value())
+            .build();
+        let deposit_tx = TransactionBuilder::default()
+            .version(0u32)
+            .output(dao_cell_output(&consensus, 100))
+            .output_data(le_u64_bytes(0))
+            .build();
+        let ordinary_prev = TransactionBuilder::default()
+            .version(0u32)
+            .output(simple_cell_output(1))
+            .output_data(ckb_types::bytes::Bytes::new())
+            .build();
+        let withdrawing_tx = TransactionBuilder::default()
+            .version(0u32)
+            .input(CellInput::new(
+                PackedOutPoint::new(ordinary_prev.hash(), 0),
+                0,
+            ))
+            .input(CellInput::new(PackedOutPoint::new(deposit_tx.hash(), 0), 0))
+            .output(simple_cell_output(1))
+            .output_data(ckb_types::bytes::Bytes::new())
+            .output(dao_cell_output(&consensus, 100))
+            .output_data(le_u64_bytes(7))
+            .build();
+        let current_tx = TransactionBuilder::default()
+            .version(0u32)
+            .header_dep(unrelated_header.hash())
+            .header_dep(deposit_header.hash())
+            .header_dep(wrong_last_header.hash())
+            .input(CellInput::new(
+                PackedOutPoint::new(withdrawing_tx.hash(), 1),
+                0,
+            ))
+            .witness(witness_with_input_type_u64(1))
+            .output(simple_cell_output(130))
+            .output_data(ckb_types::bytes::Bytes::new())
+            .build();
+
+        let rpc = Arc::new(MockRpc::default());
+        rpc.headers_by_hash.lock().unwrap().insert(
+            format!("{:#x}", deposit_header.hash()),
+            deposit_header.clone().into(),
+        );
+        rpc.dao_max
+            .lock()
+            .unwrap()
+            .insert(format!("{:#x}:{}", deposit_tx.hash(), 0), 130u64.into());
+        let auditor = Auditor::new(rpc.clone(), cfg);
+        let current_tx_json: TransactionView = current_tx.into();
+        let source = ResolvedCommittedTransaction {
+            tx: withdrawing_tx.into(),
+            block_hash: H256::from([5u8; 32]),
+            block_number: Some(8),
+        };
+
+        let capacity = auditor
+            .resolve_dao_input_capacity(&consensus, &current_tx_json, 0, &source, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(capacity, 130);
+        let calls = rpc.dao_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, format!("{:#x}:{}", deposit_tx.hash(), 0));
+        assert_eq!(calls[0].1, format!("header:{:#x}", H256::from([5u8; 32])));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_dao_input_rejects_invalid_data_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path().join("cursor.json"));
+        let consensus = ConsensusSnapshot::from_rpc(&cfg, mock_consensus()).unwrap();
+        let deposit_tx = TransactionBuilder::default()
+            .version(0u32)
+            .output(dao_cell_output(&consensus, 100))
+            .output_data(ckb_types::bytes::Bytes::new())
+            .build();
+        let current_tx = TransactionBuilder::default()
+            .version(0u32)
+            .input(CellInput::new(PackedOutPoint::new(deposit_tx.hash(), 0), 0))
+            .output(dao_cell_output(&consensus, 100))
+            .output_data(le_u64_bytes(1))
+            .build();
+
+        let auditor = Auditor::new(Arc::new(MockRpc::default()), cfg);
+        let err = auditor
+            .resolve_dao_input_capacity(
+                &consensus,
+                &TransactionView::from(current_tx),
+                0,
+                &ResolvedCommittedTransaction {
+                    tx: deposit_tx.into(),
+                    block_hash: H256::from([4u8; 32]),
+                    block_number: Some(1),
+                },
+                0,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.status, CheckStatus::Fail);
+        assert_eq!(err.error_code, "DAO_INPUT_DATA_INVALID");
+    }
+
+    #[tokio::test]
+    async fn test_no_cursor_mode_retries_pending_dao_height_then_advances() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("audit.log");
+        let mut cfg = test_config(dir.path().join("cursor.json"));
+        cfg.cursor_path = None;
+        cfg.log_path = Some(log_path.clone());
+        cfg.max_retries = 1;
+        let consensus = ConsensusSnapshot::from_rpc(&cfg, mock_consensus()).unwrap();
+
+        let parent_block = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(1u64)
+                    .timestamp(1000u64)
+                    .epoch(EpochNumberWithFraction::new(0, 1, 1000).full_value())
+                    .build(),
+            )
+            .transaction(empty_cellbase(1))
+            .build();
+        let deposit_tx = TransactionBuilder::default()
+            .version(0u32)
+            .output(dao_cell_output(&consensus, 100))
+            .output_data(le_u64_bytes(0))
+            .build();
+        let ordinary_prev = TransactionBuilder::default()
+            .version(0u32)
+            .output(simple_cell_output(1))
+            .output_data(ckb_types::bytes::Bytes::new())
+            .build();
+        let withdrawing_tx = TransactionBuilder::default()
+            .version(0u32)
+            .input(CellInput::new(
+                PackedOutPoint::new(ordinary_prev.hash(), 0),
+                0,
+            ))
+            .input(CellInput::new(PackedOutPoint::new(deposit_tx.hash(), 0), 0))
+            .output(simple_cell_output(10_000_000_000))
+            .output_data(ckb_types::bytes::Bytes::new())
+            .output(dao_cell_output(&consensus, 100))
+            .output_data(le_u64_bytes(1))
+            .build();
+        let final_tx = TransactionBuilder::default()
+            .version(0u32)
+            .header_dep(
+                HeaderBuilder::default()
+                    .number(9u64)
+                    .epoch(EpochNumberWithFraction::new(0, 9, 1000).full_value())
+                    .build()
+                    .hash(),
+            )
+            .header_dep(parent_block.header().hash())
+            .input(CellInput::new(
+                PackedOutPoint::new(withdrawing_tx.hash(), 1),
+                0,
+            ))
+            .witness(witness_with_input_type_u64(1))
+            .output(simple_cell_output(13_000_000_000))
+            .output_data(ckb_types::bytes::Bytes::new())
+            .build();
+        let block_2 = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(2u64)
+                    .timestamp(1200u64)
+                    .epoch(EpochNumberWithFraction::new(0, 2, 1000).full_value())
+                    .parent_hash(parent_block.header().hash())
+                    .build(),
+            )
+            .transaction(empty_cellbase(2))
+            .transaction(final_tx.clone())
+            .build();
+        let block_3 = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(3u64)
+                    .timestamp(1300u64)
+                    .epoch(EpochNumberWithFraction::new(0, 3, 1000).full_value())
+                    .parent_hash(block_2.header().hash())
+                    .build(),
+            )
+            .transaction(empty_cellbase(3))
+            .build();
+        let block_2_json: BlockView = block_2.clone().into();
+        let block_3_json: BlockView = block_3.into();
+        let parent_json: HeaderView = parent_block.header().to_owned().into();
+
+        let rpc = Arc::new(MockRpc::default());
+        *rpc.consensus.lock().unwrap() = Some(mock_consensus());
+        *rpc.tip.lock().unwrap() = Some(block_2_json.header.clone());
+        rpc.headers_by_hash
+            .lock()
+            .unwrap()
+            .insert(format!("{:#x}", parent_json.hash), parent_json.clone());
+        rpc.headers_by_number
+            .lock()
+            .unwrap()
+            .insert(1, parent_json.clone());
+        rpc.headers_by_number
+            .lock()
+            .unwrap()
+            .insert(2, block_2_json.header.clone());
+        rpc.headers_by_hash.lock().unwrap().insert(
+            format!("{:#x}", block_2_json.header.hash),
+            block_2_json.header.clone(),
+        );
+        rpc.headers_by_number
+            .lock()
+            .unwrap()
+            .insert(3, block_3_json.header.clone());
+        rpc.blocks_by_number
+            .lock()
+            .unwrap()
+            .insert(2, block_2_json.clone());
+        rpc.blocks_by_number
+            .lock()
+            .unwrap()
+            .insert(3, block_3_json.clone());
+        rpc.txs.lock().unwrap().insert(
+            format!("{:#x}", withdrawing_tx.hash()),
+            serde_json::to_value(committed_tx_response(
+                &withdrawing_tx,
+                parent_block.header().hash().unpack(),
+            ))
+            .unwrap(),
+        );
+
+        let auditor = Auditor::new(rpc.clone(), cfg);
+        let mut cursor = None;
+        auditor.poll_once(&mut cursor).await.unwrap();
+        assert!(!log_path.exists());
+        assert_eq!(cursor.as_ref().unwrap().next_height, Some(2));
+
+        rpc.dao_max.lock().unwrap().insert(
+            format!("{:#x}:{}", deposit_tx.hash(), 0),
+            13_000_000_000u64.into(),
+        );
+        *rpc.tip.lock().unwrap() = Some(block_3_json.header.clone());
+        auditor.poll_once(&mut cursor).await.unwrap();
+
+        let lines = read_log_lines(&log_path);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["block_height"], 2);
+        assert_eq!(lines[1]["block_height"], 3);
+        assert_eq!(lines[0]["result"], "PASS");
+        assert_eq!(lines[1]["result"], "PASS");
+        assert!(!dir.path().join("cursor.json").exists());
     }
 
     #[tokio::test]
