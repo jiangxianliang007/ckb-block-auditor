@@ -77,8 +77,8 @@ jobs:
           from pathlib import Path
           import re
 
-          path = Path('/tmp/ckb-dev/ckb.toml')
-          text = path.read_text()
+          node_path = Path('/tmp/ckb-dev/ckb.toml')
+          text = node_path.read_text()
           pattern = re.compile(r'(?m)^modules\s*=\s*\[(.*?)\](?:\s*#.*)?$')
           match = pattern.search(text)
           if not match:
@@ -90,11 +90,21 @@ jobs:
                   modules += ', '
               modules += '"IntegrationTest"'
               text = text[:match.start()] + f'modules = [{modules}]' + text[match.end():]
-          path.write_text(text)
+          node_path.write_text(text)
+
+          # The dev chain uses the built-in Dummy miner. Reduce its artificial
+          # delay so CI can mine ten real blocks quickly while still exercising
+          # the actual `ckb miner` process and node block-submission path.
+          miner_path = Path('/tmp/ckb-dev/ckb-miner.toml')
+          miner = miner_path.read_text()
+          miner = re.sub(r'(?m)^poll_interval\s*=\s*\d+$', 'poll_interval = 100', miner)
+          miner = re.sub(r'(?m)^value\s*=\s*\d+$', 'value = 100', miner)
+          miner_path.write_text(miner)
           PY
 
           grep '^modules' ckb.toml
           grep -q 'IntegrationTest' ckb.toml
+          grep -E '^(poll_interval|value)' ckb-miner.toml
 
       - name: Start CKB dev node
         shell: bash
@@ -114,6 +124,47 @@ jobs:
           done
           cat /tmp/ckb-node.log
           exit 1
+
+      - name: Mine 10 normal blocks with ckb miner
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/ckb-dev
+          "${CKB_BIN}" miner > /tmp/ckb-miner.log 2>&1 &
+          MINER_PID=$!
+          echo "${MINER_PID}" > /tmp/ckb-miner.pid
+
+          mined=0
+          for _ in $(seq 1 300); do
+            response="$(curl -fsS -H 'content-type: application/json' \
+              -d '{"id":1,"jsonrpc":"2.0","method":"get_tip_block_number","params":[]}' \
+              "${CKB_RPC_URL}")"
+            height="$(python3 -c 'import json,sys; v=json.load(sys.stdin)["result"]; print(int(v, 16))' <<<"${response}")"
+            if [ "${height}" -ge 10 ]; then
+              mined=1
+              echo "miner reached block height ${height}"
+              break
+            fi
+            if ! kill -0 "${MINER_PID}" 2>/dev/null; then
+              echo 'ckb miner exited before reaching height 10'
+              break
+            fi
+            sleep 0.2
+          done
+
+          # Stop the miner before fault injection so it cannot race with the
+          # deliberately injected next canonical block.
+          kill "${MINER_PID}" 2>/dev/null || true
+          wait "${MINER_PID}" 2>/dev/null || true
+          rm -f /tmp/ckb-miner.pid
+
+          if [ "${mined}" -ne 1 ]; then
+            echo '--- ckb miner log ---'
+            cat /tmp/ckb-miner.log || true
+            echo '--- ckb node log ---'
+            cat /tmp/ckb-node.log || true
+            exit 1
+          fi
 
       - name: Inject canonical block with output greater than input
         shell: bash
@@ -167,10 +218,13 @@ jobs:
           grep -q '"check_ordinary_capacity_conservation":"FAIL"' /tmp/audit.jsonl
           grep -q 'OUTPUT_CAPACITY_EXCEEDS_INPUT' /tmp/audit.jsonl
 
-      - name: Stop CKB node
+      - name: Stop CKB processes
         if: always()
         shell: bash
         run: |
+          if test -f /tmp/ckb-miner.pid; then
+            kill "$(cat /tmp/ckb-miner.pid)" 2>/dev/null || true
+          fi
           if test -f /tmp/ckb-node.pid; then
             kill "$(cat /tmp/ckb-node.pid)" 2>/dev/null || true
           fi
@@ -182,6 +236,7 @@ jobs:
           name: economic-fault-injection-logs
           path: |
             /tmp/ckb-node.log
+            /tmp/ckb-miner.log
             /tmp/fault-injection.log
             /tmp/audit.jsonl
             /tmp/auditor.stdout
