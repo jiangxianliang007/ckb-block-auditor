@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 
-use ckb_block_auditor::{Auditor, AuditorConfig, HttpRpc};
+use ckb_block_auditor::{Auditor, AuditorConfig, HttpRpc, HttpRpcPacingConfig};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "CKB Block Auditor V1")]
@@ -36,6 +36,20 @@ struct Args {
     history_retention: usize,
     #[arg(long, env = "CKB_DAO_TYPE_HASH", default_value = "")]
     dao_type_hash: String,
+    #[arg(long, env = "CKB_RPC_MIN_INTERVAL_MS", default_value_t = 100)]
+    rpc_min_interval_ms: u64,
+    #[arg(long, env = "CKB_RPC_MAX_INTERVAL_MS", default_value_t = 2000)]
+    rpc_max_interval_ms: u64,
+    #[arg(long, env = "CKB_RPC_MAX_CONCURRENCY", default_value_t = 2)]
+    rpc_max_concurrency: usize,
+    #[arg(long, env = "CKB_HEADER_CACHE_CAPACITY", default_value_t = 8192)]
+    header_cache_capacity: usize,
+    #[arg(long, env = "CKB_BLOCK_CACHE_ENTRIES", default_value_t = 64)]
+    block_cache_entries: usize,
+    #[arg(long, env = "CKB_BLOCK_CACHE_MAX_BYTES", default_value_t = 64 * 1024 * 1024)]
+    block_cache_max_bytes: usize,
+    #[arg(long, env = "CKB_STATS_INTERVAL_SECS", default_value_t = 60)]
+    stats_interval_secs: u64,
 }
 
 #[tokio::main]
@@ -56,12 +70,21 @@ async fn main() -> anyhow::Result<()> {
         tx_version: args.tx_version,
         history_retention: args.history_retention,
         dao_type_hash: args.dao_type_hash,
+        header_cache_capacity: args.header_cache_capacity,
+        block_cache_entries: args.block_cache_entries,
+        block_cache_max_bytes: args.block_cache_max_bytes,
+        stats_interval_secs: args.stats_interval_secs,
     };
 
-    let rpc = Arc::new(HttpRpc::new(
+    let rpc = Arc::new(HttpRpc::new_with_pacing(
         args.rpc_url,
         cfg.rpc_timeout_secs,
         cfg.max_retries,
+        HttpRpcPacingConfig {
+            min_interval_ms: args.rpc_min_interval_ms,
+            max_interval_ms: args.rpc_max_interval_ms,
+            max_concurrency: args.rpc_max_concurrency,
+        },
     )?);
     let auditor = Auditor::new(rpc, cfg);
     auditor.run().await

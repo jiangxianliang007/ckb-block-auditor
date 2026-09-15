@@ -24,10 +24,16 @@ use reqwest::header::RETRY_AFTER;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 const RETRY_BASE_DELAY_MS: u64 = 100;
 const RATE_LIMIT_FALLBACK_DELAY_SECS: u64 = 60;
+const DEFAULT_RPC_MIN_INTERVAL_MS: u64 = 100;
+const DEFAULT_RPC_MAX_INTERVAL_MS: u64 = 2000;
+const DEFAULT_RPC_MAX_CONCURRENCY: usize = 2;
+const RATE_INTERVAL_INCREASE_FACTOR: u64 = 2;
+const RATE_RECOVERY_SUCCESS_WINDOW: u64 = 20;
 const PENDING_LOG_REMINDER_ROUNDS: u32 = 10;
 const PENDING_EXECUTION_BACKOFF_FLOOR_SECS: u64 = 15;
 const PENDING_EXECUTION_BACKOFF_CAP_SECS: u64 = 300;
@@ -48,6 +54,10 @@ pub struct AuditorConfig {
     pub tx_version: u32,
     pub history_retention: usize,
     pub dao_type_hash: String,
+    pub header_cache_capacity: usize,
+    pub block_cache_entries: usize,
+    pub block_cache_max_bytes: usize,
+    pub stats_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -401,6 +411,24 @@ struct RpcCooldownState {
     awaiting_recovery: Option<CooldownRecoveryState>,
 }
 
+#[derive(Debug, Clone)]
+struct RpcPacingState {
+    base_interval: std::time::Duration,
+    max_interval: std::time::Duration,
+    current_interval: std::time::Duration,
+    next_send_at: std::time::Duration,
+    success_since_adjustment: u64,
+}
+
+#[derive(Debug, Default, Clone)]
+struct RpcMetricsState {
+    total_http_attempts: u64,
+    total_429_responses: u64,
+    method_attempts: HashMap<String, u64>,
+    cooldown_wait_ms: u64,
+    rate_gate_wait_ms: u64,
+}
+
 enum HeightAuditOutcome {
     Finalized {
         block: BlockView,
@@ -428,6 +456,33 @@ struct CooldownRecoveryState {
 struct RetryDelayDecision {
     delay: std::time::Duration,
     source: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HttpRpcPacingConfig {
+    pub min_interval_ms: u64,
+    pub max_interval_ms: u64,
+    pub max_concurrency: usize,
+}
+
+impl Default for HttpRpcPacingConfig {
+    fn default() -> Self {
+        Self {
+            min_interval_ms: DEFAULT_RPC_MIN_INTERVAL_MS,
+            max_interval_ms: DEFAULT_RPC_MAX_INTERVAL_MS,
+            max_concurrency: DEFAULT_RPC_MAX_CONCURRENCY,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RpcMetricsSnapshot {
+    pub total_http_attempts: u64,
+    pub total_429_responses: u64,
+    pub method_attempts: HashMap<String, u64>,
+    pub cooldown_wait_ms: u64,
+    pub rate_gate_wait_ms: u64,
+    pub current_min_interval_ms: u64,
 }
 
 #[async_trait]
@@ -1049,6 +1104,10 @@ pub trait CkbRpc: Send + Sync {
     fn has_rate_limit_cooldown(&self) -> bool {
         false
     }
+
+    fn metrics_snapshot(&self) -> Option<RpcMetricsSnapshot> {
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -1057,16 +1116,34 @@ pub struct HttpRpc {
     url: String,
     max_retries: u32,
     cooldown: Arc<StdMutex<RpcCooldownState>>,
+    pacing: Arc<StdMutex<RpcPacingState>>,
+    semaphore: Arc<Semaphore>,
+    metrics: Arc<StdMutex<RpcMetricsState>>,
     shutdown: CancellationToken,
     clock: Arc<dyn RpcClock>,
 }
 
 impl HttpRpc {
     pub fn new(url: String, timeout_secs: u64, max_retries: u32) -> Result<Self> {
+        Self::new_with_pacing(
+            url,
+            timeout_secs,
+            max_retries,
+            HttpRpcPacingConfig::default(),
+        )
+    }
+
+    pub fn new_with_pacing(
+        url: String,
+        timeout_secs: u64,
+        max_retries: u32,
+        pacing: HttpRpcPacingConfig,
+    ) -> Result<Self> {
         Self::new_with_dependencies(
             url,
             timeout_secs,
             max_retries,
+            pacing,
             CancellationToken::new(),
             Arc::new(SystemRpcClock::new()),
         )
@@ -1080,13 +1157,21 @@ impl HttpRpc {
         shutdown: CancellationToken,
         clock: Arc<dyn RpcClock>,
     ) -> Result<Self> {
-        Self::new_with_dependencies(url, timeout_secs, max_retries, shutdown, clock)
+        Self::new_with_dependencies(
+            url,
+            timeout_secs,
+            max_retries,
+            HttpRpcPacingConfig::default(),
+            shutdown,
+            clock,
+        )
     }
 
     fn new_with_dependencies(
         url: String,
         timeout_secs: u64,
         max_retries: u32,
+        pacing: HttpRpcPacingConfig,
         shutdown: CancellationToken,
         clock: Arc<dyn RpcClock>,
     ) -> Result<Self> {
@@ -1094,11 +1179,24 @@ impl HttpRpc {
             .timeout(std::time::Duration::from_secs(timeout_secs))
             .build()
             .context("failed to build http client")?;
+        let min_interval_ms = pacing.min_interval_ms.max(1);
+        let max_interval_ms = pacing.max_interval_ms.max(min_interval_ms);
+        let base_interval = std::time::Duration::from_millis(min_interval_ms);
+        let max_interval = std::time::Duration::from_millis(max_interval_ms);
         Ok(Self {
             client,
             url,
             max_retries,
             cooldown: Arc::new(StdMutex::new(RpcCooldownState::default())),
+            pacing: Arc::new(StdMutex::new(RpcPacingState {
+                base_interval,
+                max_interval,
+                current_interval: base_interval,
+                next_send_at: std::time::Duration::ZERO,
+                success_since_adjustment: 0,
+            })),
+            semaphore: Arc::new(Semaphore::new(pacing.max_concurrency.max(1))),
+            metrics: Arc::new(StdMutex::new(RpcMetricsState::default())),
             shutdown,
             clock,
         })
@@ -1148,11 +1246,79 @@ impl HttpRpc {
             let Some(deadline) = deadline else {
                 return Ok(());
             };
-            self.sleep(
-                deadline.saturating_sub(self.clock.now()),
-                "during rpc cooldown",
-            )
-            .await?;
+            let wait = deadline.saturating_sub(self.clock.now());
+            {
+                let mut metrics = self.metrics.lock().unwrap();
+                metrics.cooldown_wait_ms = metrics
+                    .cooldown_wait_ms
+                    .saturating_add(wait.as_millis() as u64);
+            }
+            self.sleep(wait, "during rpc cooldown").await?;
+        }
+    }
+
+    async fn acquire_rate_permit(&self) -> Result<OwnedSemaphorePermit> {
+        tokio::select! {
+            permit = self.semaphore.clone().acquire_owned() => {
+                permit.context("rpc request semaphore closed")
+            }
+            _ = self.shutdown.cancelled() => Err(shutdown_error("while waiting for rpc concurrency permit")),
+        }
+    }
+
+    async fn wait_for_rate_slot(&self) -> Result<()> {
+        loop {
+            let delay = {
+                let mut pacing = self.pacing.lock().unwrap();
+                let now = self.clock.now();
+                let start_at = pacing.next_send_at.max(now);
+                let delay = start_at.saturating_sub(now);
+                if delay.is_zero() {
+                    pacing.next_send_at = now + pacing.current_interval;
+                }
+                delay
+            };
+            if delay.is_zero() {
+                return Ok(());
+            }
+            {
+                let mut metrics = self.metrics.lock().unwrap();
+                metrics.rate_gate_wait_ms = metrics
+                    .rate_gate_wait_ms
+                    .saturating_add(delay.as_millis() as u64);
+            }
+            self.sleep(delay, "during rpc rate pacing").await?;
+        }
+    }
+
+    fn on_rate_limited(&self) {
+        let mut pacing = self.pacing.lock().unwrap();
+        pacing.success_since_adjustment = 0;
+        let mut next = pacing
+            .current_interval
+            .saturating_mul(RATE_INTERVAL_INCREASE_FACTOR as u32);
+        if next > pacing.max_interval {
+            next = pacing.max_interval;
+        }
+        pacing.current_interval = next.max(pacing.base_interval);
+    }
+
+    fn on_success(&self) {
+        let mut pacing = self.pacing.lock().unwrap();
+        pacing.success_since_adjustment = pacing.success_since_adjustment.saturating_add(1);
+        if pacing.success_since_adjustment < RATE_RECOVERY_SUCCESS_WINDOW {
+            return;
+        }
+        pacing.success_since_adjustment = 0;
+        if pacing.current_interval <= pacing.base_interval {
+            pacing.current_interval = pacing.base_interval;
+            return;
+        }
+        let diff = pacing.current_interval.saturating_sub(pacing.base_interval);
+        let reduction = std::time::Duration::from_millis((diff.as_millis() as u64 / 4).max(1));
+        pacing.current_interval = pacing.current_interval.saturating_sub(reduction);
+        if pacing.current_interval < pacing.base_interval {
+            pacing.current_interval = pacing.base_interval;
         }
     }
 
@@ -1189,6 +1355,11 @@ impl HttpRpc {
     }
 
     fn record_cooldown(&self, method: &str, decision: RetryDelayDecision, reason: &str) {
+        self.on_rate_limited();
+        {
+            let mut metrics = self.metrics.lock().unwrap();
+            metrics.total_429_responses = metrics.total_429_responses.saturating_add(1);
+        }
         let now = self.clock.now();
         let new_deadline = now + decision.delay;
         let resume_at_utc = chrono::Duration::from_std(decision.delay)
@@ -1254,6 +1425,18 @@ impl HttpRpc {
         let total_attempts = self.max_retries.saturating_add(1);
         for attempt in 1..=total_attempts {
             self.wait_for_cooldown().await?;
+            let _permit = self.acquire_rate_permit().await?;
+            self.wait_for_rate_slot().await?;
+            self.wait_for_cooldown().await?;
+            {
+                let mut metrics = self.metrics.lock().unwrap();
+                metrics.total_http_attempts = metrics.total_http_attempts.saturating_add(1);
+                let entry = metrics
+                    .method_attempts
+                    .entry(method.to_string())
+                    .or_default();
+                *entry = entry.saturating_add(1);
+            }
             let payload = json!({
                 "id": 1,
                 "jsonrpc": "2.0",
@@ -1302,6 +1485,7 @@ impl HttpRpc {
                         .get("result")
                         .ok_or_else(|| anyhow!("rpc {} missing result", method))?
                         .clone();
+                    self.on_success();
                     self.mark_cooldown_recovered(method);
                     return serde_json::from_value(result)
                         .with_context(|| format!("rpc {method} result decode failed"));
@@ -1378,6 +1562,52 @@ impl CkbRpc for HttpRpc {
     fn has_rate_limit_cooldown(&self) -> bool {
         self.current_cooldown_deadline().is_some()
     }
+
+    fn metrics_snapshot(&self) -> Option<RpcMetricsSnapshot> {
+        let metrics = self.metrics.lock().unwrap().clone();
+        let pacing = self.pacing.lock().unwrap().clone();
+        Some(RpcMetricsSnapshot {
+            total_http_attempts: metrics.total_http_attempts,
+            total_429_responses: metrics.total_429_responses,
+            method_attempts: metrics.method_attempts,
+            cooldown_wait_ms: metrics.cooldown_wait_ms,
+            rate_gate_wait_ms: metrics.rate_gate_wait_ms,
+            current_min_interval_ms: pacing.current_interval.as_millis() as u64,
+        })
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct HeaderCacheState {
+    map: HashMap<String, HeaderView>,
+    order: VecDeque<String>,
+    capacity: usize,
+    hits: u64,
+    misses: u64,
+}
+
+#[derive(Debug, Clone)]
+struct BlockCacheEntry {
+    block: BlockView,
+    bytes: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+struct BlockCacheState {
+    map: HashMap<String, BlockCacheEntry>,
+    order: VecDeque<String>,
+    max_entries: usize,
+    max_bytes: usize,
+    used_bytes: usize,
+    hits: u64,
+    misses: u64,
+}
+
+#[derive(Debug, Default, Clone)]
+struct AuditorStatsState {
+    last_report_at: std::time::Duration,
+    last_reported_attempts: u64,
+    last_completed_height: Option<u64>,
 }
 
 pub enum LogSink {
@@ -1411,6 +1641,9 @@ pub struct Auditor<R: CkbRpc> {
     consensus_cache: tokio::sync::Mutex<Option<ConsensusSnapshot>>,
     emitted_audits: StdMutex<EmittedAuditWindow>,
     pending_audits: StdMutex<PendingAuditWindow>,
+    header_cache: StdMutex<HeaderCacheState>,
+    block_cache: StdMutex<BlockCacheState>,
+    stats: StdMutex<AuditorStatsState>,
     shutdown: CancellationToken,
     clock: Arc<dyn RpcClock>,
 }
@@ -1439,6 +1672,16 @@ impl<R: CkbRpc> Auditor<R> {
         let emitted_audits =
             EmittedAuditWindow::load(config.log_path.as_deref(), config.history_retention);
         let pending_audits = PendingAuditWindow::new(config.history_retention);
+        let header_cache = HeaderCacheState {
+            capacity: config.header_cache_capacity.max(1),
+            ..Default::default()
+        };
+        let block_cache = BlockCacheState {
+            max_entries: config.block_cache_entries.max(1),
+            max_bytes: config.block_cache_max_bytes.max(1),
+            ..Default::default()
+        };
+        let now = clock.now();
         Self {
             rpc,
             config,
@@ -1446,6 +1689,12 @@ impl<R: CkbRpc> Auditor<R> {
             consensus_cache: tokio::sync::Mutex::new(None),
             emitted_audits: StdMutex::new(emitted_audits),
             pending_audits: StdMutex::new(pending_audits),
+            header_cache: StdMutex::new(header_cache),
+            block_cache: StdMutex::new(block_cache),
+            stats: StdMutex::new(AuditorStatsState {
+                last_report_at: now,
+                ..Default::default()
+            }),
             shutdown,
             clock,
         }
@@ -1483,6 +1732,162 @@ impl<R: CkbRpc> Auditor<R> {
             state.save(path).await?;
         }
         Ok(())
+    }
+
+    fn estimate_block_bytes(block: &BlockView) -> usize {
+        serde_json::to_vec(block)
+            .map(|bytes| bytes.len())
+            .unwrap_or(0)
+    }
+
+    fn cache_header(&self, header: &HeaderView) {
+        let key = format!("{:#x}", header.hash);
+        let mut cache = self.header_cache.lock().unwrap();
+        if cache.map.contains_key(&key) {
+            cache.order.retain(|existing| existing != &key);
+        }
+        cache.map.insert(key.clone(), header.clone());
+        cache.order.push_back(key);
+        while cache.map.len() > cache.capacity {
+            if let Some(oldest) = cache.order.pop_front() {
+                cache.map.remove(&oldest);
+            }
+        }
+    }
+
+    fn cache_block(&self, block: &BlockView) {
+        self.cache_header(&block.header);
+        let key = format!("{:#x}", block.header.hash);
+        let bytes = Self::estimate_block_bytes(block);
+        let mut cache = self.block_cache.lock().unwrap();
+        if bytes == 0 || bytes > cache.max_bytes {
+            return;
+        }
+        if let Some(old) = cache.map.remove(&key) {
+            cache.used_bytes = cache.used_bytes.saturating_sub(old.bytes);
+            cache.order.retain(|existing| existing != &key);
+        }
+        cache.used_bytes = cache.used_bytes.saturating_add(bytes);
+        cache.order.push_back(key.clone());
+        cache.map.insert(
+            key,
+            BlockCacheEntry {
+                block: block.clone(),
+                bytes,
+            },
+        );
+        while cache.map.len() > cache.max_entries || cache.used_bytes > cache.max_bytes {
+            let Some(oldest) = cache.order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = cache.map.remove(&oldest) {
+                cache.used_bytes = cache.used_bytes.saturating_sub(evicted.bytes);
+            }
+        }
+    }
+
+    async fn get_header_cached(&self, hash: &H256) -> Result<Option<HeaderView>> {
+        let key = format!("{hash:#x}");
+        if let Some(hit) = {
+            let mut cache = self.header_cache.lock().unwrap();
+            let hit = cache.map.get(&key).cloned();
+            if hit.is_some() {
+                cache.hits = cache.hits.saturating_add(1);
+            } else {
+                cache.misses = cache.misses.saturating_add(1);
+            }
+            hit
+        } {
+            return Ok(Some(hit));
+        }
+        let fetched = self.rpc.get_header(hash).await?;
+        if let Some(header) = fetched {
+            if header.hash != *hash {
+                return Err(anyhow!(
+                    "get_header returned mismatched hash, requested {hash:#x}, got {:#x}",
+                    header.hash
+                ));
+            }
+            self.cache_header(&header);
+            return Ok(Some(header));
+        }
+        Ok(None)
+    }
+
+    async fn get_block_cached(&self, hash: &H256) -> Result<Option<BlockView>> {
+        let key = format!("{hash:#x}");
+        if let Some(hit) = {
+            let mut cache = self.block_cache.lock().unwrap();
+            let hit = cache.map.get(&key).map(|entry| entry.block.clone());
+            if hit.is_some() {
+                cache.hits = cache.hits.saturating_add(1);
+            } else {
+                cache.misses = cache.misses.saturating_add(1);
+            }
+            hit
+        } {
+            return Ok(Some(hit));
+        }
+        let fetched = self.rpc.get_block(hash).await?;
+        if let Some(block) = fetched {
+            if block.header.hash == *hash {
+                self.cache_block(&block);
+            }
+            return Ok(Some(block));
+        }
+        Ok(None)
+    }
+
+    fn maybe_report_stats(&self, tip_height: u64, current_height: Option<u64>) {
+        let interval = std::time::Duration::from_secs(self.config.stats_interval_secs.max(1));
+        let now = self.clock.now();
+        let mut state = self.stats.lock().unwrap();
+        if now.saturating_sub(state.last_report_at) < interval {
+            if let Some(height) = current_height {
+                state.last_completed_height = Some(height);
+            }
+            return;
+        }
+        let rpc_metrics = self.rpc.metrics_snapshot().unwrap_or_default();
+        let header_cache = self.header_cache.lock().unwrap().clone();
+        let block_cache = self.block_cache.lock().unwrap().clone();
+        let elapsed = now.saturating_sub(state.last_report_at).as_secs_f64();
+        let current = current_height
+            .or(state.last_completed_height)
+            .unwrap_or(tip_height);
+        let backlog = tip_height.saturating_sub(current);
+        let block_rate = state
+            .last_completed_height
+            .map(|last| current.saturating_sub(last) as f64 / elapsed.max(1e-9))
+            .unwrap_or(0.0);
+        let attempt_delta = rpc_metrics
+            .total_http_attempts
+            .saturating_sub(state.last_reported_attempts);
+        let req_rate = attempt_delta as f64 / elapsed.max(1e-9);
+        eprintln!(
+            "operational stats height={} tip={} backlog={} blocks_per_sec={:.3} http_attempts_total={} http_attempts_delta={} req_per_sec={:.3} method_attempts={:?} http_429_total={} cooldown_wait_ms_total={} rate_wait_ms_total={} rate_min_interval_ms={} header_cache_hits={} header_cache_misses={} block_cache_hits={} block_cache_misses={}",
+            current,
+            tip_height,
+            backlog,
+            block_rate,
+            rpc_metrics.total_http_attempts,
+            attempt_delta,
+            req_rate,
+            rpc_metrics.method_attempts,
+            rpc_metrics.total_429_responses,
+            rpc_metrics.cooldown_wait_ms,
+            rpc_metrics.rate_gate_wait_ms,
+            rpc_metrics.current_min_interval_ms,
+            header_cache.hits,
+            header_cache.misses,
+            block_cache.hits,
+            block_cache.misses,
+        );
+        state.last_report_at = now;
+        state.last_reported_attempts = rpc_metrics.total_http_attempts;
+        if let Some(height) = current_height {
+            state.last_completed_height = Some(height);
+        }
     }
 
     fn write_final_audit_once(&self, log: &AuditLog) -> Result<bool> {
@@ -1716,9 +2121,11 @@ impl<R: CkbRpc> Auditor<R> {
             tip_height
         };
         if tip_height < start_height {
+            self.maybe_report_stats(tip_height, cursor.as_ref().map(|state| state.last_height));
             return Ok(());
         }
 
+        let mut latest_completed = cursor.as_ref().map(|state| state.last_height);
         for height in start_height..=tip_height {
             let pending_hash = cursor.as_ref().and_then(|state| {
                 (state.next_height == Some(height))
@@ -1773,6 +2180,7 @@ impl<R: CkbRpc> Auditor<R> {
                 );
             }
             if completed {
+                latest_completed = Some(height);
                 self.note_pending_recovery(&block);
                 self.write_final_audit_once(&log)?;
                 if let Some(state) = cursor.as_mut() {
@@ -1812,6 +2220,8 @@ impl<R: CkbRpc> Auditor<R> {
                 break;
             }
         }
+
+        self.maybe_report_stats(tip_height, latest_completed);
 
         Ok(())
     }
@@ -1882,6 +2292,7 @@ impl<R: CkbRpc> Auditor<R> {
                 eprintln!("missing block at height {height}, stop this round");
                 return Ok(None);
             };
+            self.cache_block(&block);
             let mut log = self
                 .audit_block_with_consensus_once(&block, consensus)
                 .await;
@@ -2161,6 +2572,7 @@ impl<R: CkbRpc> Auditor<R> {
         log: &mut AuditLog,
         consensus: Option<&ConsensusSnapshot>,
     ) {
+        self.cache_header(&block.header);
         let header_number = block.header.inner.number.value();
 
         if header_number == 0 {
@@ -2169,7 +2581,10 @@ impl<R: CkbRpc> Auditor<R> {
             log.check_epoch_continuity = CheckStatus::Pass;
             log.check_timestamp = CheckStatus::Pass;
         } else {
-            match self.rpc.get_header(&block.header.inner.parent_hash).await {
+            match self
+                .get_header_cached(&block.header.inner.parent_hash)
+                .await
+            {
                 Ok(Some(parent)) => {
                     let parent_number = parent.inner.number.value();
                     if header_number == parent_number + 1 {
@@ -2277,7 +2692,7 @@ impl<R: CkbRpc> Auditor<R> {
                             if walk_hash == H256::default() {
                                 break;
                             }
-                            match self.rpc.get_header(&walk_hash).await {
+                            match self.get_header_cached(&walk_hash).await {
                                 Ok(Some(h)) => {
                                     timestamps.push(h.inner.timestamp.value());
                                     walk_hash = h.inner.parent_hash;
@@ -4240,7 +4655,10 @@ impl<R: CkbRpc> Auditor<R> {
 
         let target_number = block_number - consensus.finalization_delay_length;
         let target_header = match self.rpc.get_header_by_number(target_number).await {
-            Ok(Some(header)) => header,
+            Ok(Some(header)) => {
+                self.cache_header(&header);
+                header
+            }
             Ok(None) => {
                 log.check_cellbase_reward_amount = CheckStatus::Unknown;
                 log.check_cellbase_reward_target = CheckStatus::Unknown;
@@ -4297,7 +4715,7 @@ impl<R: CkbRpc> Auditor<R> {
                     return;
                 }
 
-                let target_block = match self.rpc.get_block(&target_hash).await {
+                let target_block = match self.get_block_cached(&target_hash).await {
                     Ok(Some(target_block)) if target_block.header.hash == target_hash => {
                         target_block
                     }
@@ -4863,6 +5281,24 @@ mod tests {
         dao_errors: Mutex<HashMap<String, String>>,
         dao_calls: Mutex<Vec<(String, String)>>,
         consensus: Mutex<Option<RpcConsensus>>,
+        method_calls: Mutex<HashMap<String, u64>>,
+    }
+
+    impl MockRpc {
+        fn bump(&self, method: &str) {
+            let mut calls = self.method_calls.lock().unwrap();
+            let entry = calls.entry(method.to_string()).or_default();
+            *entry = entry.saturating_add(1);
+        }
+
+        fn method_calls(&self, method: &str) -> u64 {
+            self.method_calls
+                .lock()
+                .unwrap()
+                .get(method)
+                .copied()
+                .unwrap_or(0)
+        }
     }
 
     struct ManualRpcClock {
@@ -4922,9 +5358,11 @@ mod tests {
     #[async_trait]
     impl CkbRpc for MockRpc {
         async fn get_tip_header(&self) -> Result<Option<HeaderView>> {
+            self.bump("get_tip_header");
             Ok(self.tip.lock().unwrap().clone())
         }
         async fn get_block(&self, hash: &H256) -> Result<Option<BlockView>> {
+            self.bump("get_block");
             Ok(self
                 .blocks_by_hash
                 .lock()
@@ -4933,9 +5371,11 @@ mod tests {
                 .cloned())
         }
         async fn get_header_by_number(&self, number: u64) -> Result<Option<HeaderView>> {
+            self.bump("get_header_by_number");
             Ok(self.headers_by_number.lock().unwrap().get(&number).cloned())
         }
         async fn get_header(&self, hash: &H256) -> Result<Option<HeaderView>> {
+            self.bump("get_header");
             Ok(self
                 .headers_by_hash
                 .lock()
@@ -4944,12 +5384,14 @@ mod tests {
                 .cloned())
         }
         async fn get_block_by_number(&self, number: u64) -> Result<Option<BlockView>> {
+            self.bump("get_block_by_number");
             Ok(self.blocks_by_number.lock().unwrap().get(&number).cloned())
         }
         async fn get_transaction(
             &self,
             hash: &H256,
         ) -> Result<Option<TransactionWithStatusResponse>> {
+            self.bump("get_transaction");
             Ok(self
                 .txs
                 .lock()
@@ -4963,6 +5405,7 @@ mod tests {
             &self,
             hash: &H256,
         ) -> Result<Option<BlockEconomicState>> {
+            self.bump("get_block_economic_state");
             Ok(self
                 .economics
                 .lock()
@@ -4971,6 +5414,7 @@ mod tests {
                 .cloned())
         }
         async fn get_consensus(&self) -> Result<RpcConsensus> {
+            self.bump("get_consensus");
             self.consensus
                 .lock()
                 .unwrap()
@@ -4982,6 +5426,7 @@ mod tests {
             out_point: OutPoint,
             kind: DaoWithdrawingCalculationKind,
         ) -> Result<Option<Uint64>> {
+            self.bump("calculate_dao_maximum_withdraw");
             let out_point_key = format!("{:#x}:{}", out_point.tx_hash, out_point.index.value());
             let kind_key = match &kind {
                 DaoWithdrawingCalculationKind::WithdrawingHeaderHash(hash) => {
@@ -5190,6 +5635,10 @@ mod tests {
             tx_version: 0,
             history_retention: 32,
             dao_type_hash: String::new(),
+            header_cache_capacity: 8192,
+            block_cache_entries: 64,
+            block_cache_max_bytes: 64 * 1024 * 1024,
+            stats_interval_secs: 60,
         }
     }
 
@@ -6338,6 +6787,77 @@ mod tests {
         let cancelled = blocked.await.unwrap().unwrap_err();
         assert!(is_shutdown_error(&cancelled));
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_http_rate_gate_enforces_min_spacing_across_concurrent_calls() {
+        let header = HeaderBuilder::default()
+            .number(9u64)
+            .epoch(EpochNumberWithFraction::new(0, 9, 1000).full_value())
+            .build();
+        let response_body = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": HeaderView::from(header.clone()),
+        }))
+        .unwrap();
+        let (url, request_count, handle) = serve_http_sequence(vec![
+            TestHttpResponse {
+                status: "200 OK".to_string(),
+                body: response_body.clone(),
+                extra_headers: vec![],
+            },
+            TestHttpResponse {
+                status: "200 OK".to_string(),
+                body: response_body,
+                extra_headers: vec![],
+            },
+        ]);
+        let clock = Arc::new(ManualRpcClock::new(
+            DateTime::parse_from_rfc3339("2026-09-15T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        ));
+        let rpc = HttpRpc::new_with_dependencies(
+            url,
+            5,
+            0,
+            HttpRpcPacingConfig {
+                min_interval_ms: 500,
+                max_interval_ms: 2000,
+                max_concurrency: 8,
+            },
+            CancellationToken::new(),
+            clock.clone(),
+        )
+        .unwrap();
+        let clone = rpc.clone();
+
+        let first = tokio::spawn(async move { clone.get_tip_header().await });
+        tokio::task::yield_now().await;
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+        let second_rpc = rpc.clone();
+        let second = tokio::spawn(async move { second_rpc.get_tip_header().await });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            1,
+            "second call should be paced before send"
+        );
+
+        clock.advance(std::time::Duration::from_millis(499));
+        tokio::task::yield_now().await;
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+        clock.advance(std::time::Duration::from_millis(1));
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        let metrics = rpc.metrics_snapshot().unwrap();
+        assert_eq!(metrics.total_http_attempts, 2);
+        assert!(metrics.rate_gate_wait_ms >= 500);
         handle.join().unwrap();
     }
 
@@ -7539,6 +8059,168 @@ mod tests {
             .audit_transactions(&block_json, &core_block, &mut log, Some(&consensus))
             .await;
         assert_eq!(log.check_output_lock_hash_type, CheckStatus::Pass);
+    }
+
+    #[tokio::test]
+    async fn test_header_cache_reuses_ancestor_headers_across_adjacent_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().join("cursor.json"));
+        cfg.cursor_path = None;
+        cfg.header_cache_capacity = 4096;
+        let rpc = Arc::new(MockRpc::default());
+
+        let mut parent_hash = H256::default();
+        let mut blocks = Vec::new();
+        for height in 0..=60u64 {
+            let header = HeaderBuilder::default()
+                .number(height)
+                .timestamp(1_000 + height * 10)
+                .epoch(EpochNumberWithFraction::new(0, height, 1000).full_value())
+                .parent_hash(parent_hash.pack())
+                .build();
+            parent_hash = header.hash().unpack();
+            blocks.push(
+                BlockBuilder::default()
+                    .header(header.clone())
+                    .transaction(empty_cellbase(height))
+                    .build(),
+            );
+        }
+        for block in &blocks {
+            let header_json: HeaderView = block.header().to_owned().into();
+            let block_json: BlockView = block.clone().into();
+            rpc.headers_by_hash
+                .lock()
+                .unwrap()
+                .insert(format!("{:#x}", header_json.hash), header_json.clone());
+            rpc.headers_by_number
+                .lock()
+                .unwrap()
+                .insert(header_json.inner.number.value(), header_json);
+            rpc.blocks_by_number
+                .lock()
+                .unwrap()
+                .insert(block_json.header.inner.number.value(), block_json.clone());
+            rpc.blocks_by_hash
+                .lock()
+                .unwrap()
+                .insert(format!("{:#x}", block_json.header.hash), block_json);
+        }
+
+        let mut consensus_value = serde_json::to_value(mock_consensus()).unwrap();
+        consensus_value["median_time_block_count"] = json!("0x25");
+        let consensus =
+            ConsensusSnapshot::from_rpc(&cfg, serde_json::from_value(consensus_value).unwrap())
+                .unwrap();
+        let auditor = Auditor::new(rpc.clone(), cfg.clone());
+
+        let first_block_json: BlockView = blocks[50].clone().into();
+        let first_core: CoreBlockView = blocks[50].clone();
+        let mut first_log = AuditLog::new(&cfg, &first_block_json);
+        auditor
+            .audit_header_and_block(
+                &first_block_json,
+                &first_core,
+                &mut first_log,
+                Some(&consensus),
+            )
+            .await;
+        let header_calls_after_first = rpc.method_calls("get_header");
+        assert!(header_calls_after_first > 0);
+
+        let second_block_json: BlockView = blocks[51].clone().into();
+        let second_core: CoreBlockView = blocks[51].clone();
+        let mut second_log = AuditLog::new(&cfg, &second_block_json);
+        auditor
+            .audit_header_and_block(
+                &second_block_json,
+                &second_core,
+                &mut second_log,
+                Some(&consensus),
+            )
+            .await;
+        let header_calls_after_second = rpc.method_calls("get_header");
+        assert_eq!(
+            header_calls_after_second.saturating_sub(header_calls_after_first),
+            1,
+            "warm adjacent block should add at most one header fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reward_target_block_uses_block_cache_on_reaudit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().join("cursor.json"));
+        cfg.cursor_path = None;
+        cfg.block_cache_entries = 8;
+        cfg.block_cache_max_bytes = 8 * 1024 * 1024;
+        let rpc = Arc::new(MockRpc::default());
+        let target_header = HeaderBuilder::default()
+            .number(42u64)
+            .timestamp(1000u64)
+            .epoch(EpochNumberWithFraction::new(0, 42, 1000).full_value())
+            .build();
+        let target_block = BlockBuilder::default()
+            .header(target_header.clone())
+            .transaction(empty_cellbase(42))
+            .build();
+        rpc.blocks_by_hash.lock().unwrap().insert(
+            format!("{:#x}", target_block.header().hash()),
+            target_block.clone().into(),
+        );
+        let auditor = Auditor::new(rpc.clone(), cfg);
+        let target_hash: H256 = target_block.header().hash().unpack();
+
+        let first = auditor.get_block_cached(&target_hash).await.unwrap();
+        assert!(first.is_some());
+        let get_block_calls_after_first = rpc.method_calls("get_block");
+        assert_eq!(get_block_calls_after_first, 1);
+
+        let second = auditor.get_block_cached(&target_hash).await.unwrap();
+        assert!(second.is_some());
+        let get_block_calls_after_second = rpc.method_calls("get_block");
+        assert_eq!(
+            get_block_calls_after_second, get_block_calls_after_first,
+            "second reward audit should reuse cached target block"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_block_cache_respects_byte_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().join("cursor.json"));
+        cfg.cursor_path = None;
+        cfg.block_cache_entries = 8;
+        cfg.block_cache_max_bytes = 1;
+        let rpc = Arc::new(MockRpc::default());
+
+        let target_header = HeaderBuilder::default()
+            .number(42u64)
+            .timestamp(1000u64)
+            .epoch(EpochNumberWithFraction::new(0, 42, 1000).full_value())
+            .build();
+        let target_block = BlockBuilder::default()
+            .header(target_header.clone())
+            .transaction(empty_cellbase(42))
+            .build();
+        rpc.blocks_by_hash.lock().unwrap().insert(
+            format!("{:#x}", target_block.header().hash()),
+            target_block.clone().into(),
+        );
+        let auditor = Auditor::new(rpc.clone(), cfg);
+        let target_hash: H256 = target_block.header().hash().unpack();
+
+        let first = auditor.get_block_cached(&target_hash).await.unwrap();
+        assert!(first.is_some());
+        let calls_after_first = rpc.method_calls("get_block");
+        let second = auditor.get_block_cached(&target_hash).await.unwrap();
+        assert!(second.is_some());
+        let calls_after_second = rpc.method_calls("get_block");
+        assert_eq!(
+            calls_after_second,
+            calls_after_first + 1,
+            "tiny byte limit should disable effective block reuse"
+        );
     }
 
     #[tokio::test]
