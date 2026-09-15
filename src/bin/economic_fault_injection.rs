@@ -94,7 +94,8 @@ async fn main() -> Result<()> {
     // Start from a node-generated next-block template so parent/epoch/timestamp,
     // cellbase, extension, proposals and uncle data remain realistic. Replace the
     // transaction list with exactly one deliberately inflationary transaction.
-    let mut template: BlockTemplate = rpc(&client, &rpc_url, "get_block_template", json!([])).await?;
+    let mut template: BlockTemplate =
+        rpc(&client, &rpc_url, "get_block_template", json!([])).await?;
     template.transactions.clear();
     template.transactions.push(TransactionTemplate {
         hash: malicious_hash.clone(),
