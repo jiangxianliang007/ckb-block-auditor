@@ -79,11 +79,18 @@ cargo build --release --locked
 | `--poll-interval-ms` | `CKB_POLL_INTERVAL_MS` | `3000` | ms | 每轮 `poll_once` 之间的等待时间 |
 | `--rpc-timeout-secs` | `CKB_RPC_TIMEOUT_SECS` | `10` | s | 单次 HTTP RPC 请求超时 |
 | `--max-retries` | `CKB_MAX_RETRIES` | `2` | 次 | 每个 HTTP 请求、每个区块额外重试次数；总尝试次数 = `max_retries + 1` |
+| `--rpc-min-interval-ms` | `CKB_RPC_MIN_INTERVAL_MS` | `100` | ms | 全局请求最小间隔（所有方法/重试/并发共享），用于平滑主动限速 |
+| `--rpc-max-interval-ms` | `CKB_RPC_MAX_INTERVAL_MS` | `2000` | ms | 自适应降速上限；遇到 429 会在该上限内放慢，持续成功后逐步恢复 |
+| `--rpc-max-concurrency` | `CKB_RPC_MAX_CONCURRENCY` | `2` | 请求数 | 全局并发上限（所有方法共享），避免恢复时瞬时并发突发 |
 | `--cursor-path` | `CKB_CURSOR_PATH` | 无 | 路径 | 启用持久化 cursor；不传则只保留进程内状态 |
 | `--log-path` | `CKB_LOG_PATH` | 无 | 路径 | 最终审计 JSON 输出文件；不传则输出到 stdout |
 | `--max-details` | `CKB_MAX_DETAILS` | `200` | 条 | 每条最终日志最多保留多少条 `details`；`failed_checks` 仍保持完整 |
 | `--max-future-ms` | `CKB_MAX_FUTURE_MS` | `15000` | ms | `check_timestamp` 允许区块时间领先审计机时钟的最大偏移 |
 | `--history-retention` | `CKB_HISTORY_RETENTION` | `256` | 高度/条 | cursor 历史哈希保留深度，也用于文件日志的近期重复输出恢复窗口 |
+| `--header-cache-capacity` | `CKB_HEADER_CACHE_CAPACITY` | `8192` | 条 | 只读内存头部缓存上限（按 hash 键控，满后淘汰） |
+| `--block-cache-entries` | `CKB_BLOCK_CACHE_ENTRIES` | `64` | 条 | 只读内存块缓存条目上限（按 hash 键控） |
+| `--block-cache-max-bytes` | `CKB_BLOCK_CACHE_MAX_BYTES` | `67108864` | bytes | 只读内存块缓存总字节上限；超限按旧条目淘汰 |
+| `--stats-interval-secs` | `CKB_STATS_INTERVAL_SECS` | `60` | s | stderr 运行统计输出间隔（HTTP 尝试/429/缓存命中/进度） |
 | `--dao-type-hash` | `CKB_DAO_TYPE_HASH` | 空字符串 | hash | 可选启动保护：若配置，必须与 `get_consensus.dao_type_hash` 一致 |
 | `--median-time-span` | `CKB_MEDIAN_TIME_SPAN` | `11` | - | 当前仅解析参数；已实现时间戳检查实际使用 `get_consensus.median_time_block_count` |
 | `--proposal-limit` | `CKB_PROPOSAL_LIMIT` | `1500` | - | 当前仅解析参数；已实现提案上限检查实际使用 `get_consensus.max_block_proposals_limit` |
