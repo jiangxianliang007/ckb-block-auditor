@@ -256,7 +256,7 @@ cargo build --release --locked
 
 ### 5.4 交易：版本、依赖、输入输出与容量
 
-版本、重复 cell/header deps、outputs_data 长度与输出 lock hash_type 检查覆盖**所有交易，包括 cellbase**。其余本节检查仍针对非 cellbase 交易，cellbase 的特殊输入输出结构与奖励分别由专用检查处理；不适用的字段不输出到最终 JSON。
+版本、重复 cell/header deps 与输出 lock hash_type 检查覆盖**所有交易，包括 cellbase**。其余本节检查仍针对非 cellbase 交易，cellbase 的特殊输入输出结构与奖励分别由专用检查处理；不适用的字段不输出到最终 JSON。
 
 #### `check_transaction_version`
 
@@ -271,7 +271,7 @@ cargo build --release --locked
 
 #### `check_outputs_data_length`
 
-- PASS 条件：每笔交易（包括 cellbase）都必须满足 `outputs.len() == outputs_data.len()`。
+- PASS 条件：每笔非 cellbase 交易都必须满足 `outputs.len() == outputs_data.len()`；cellbase 的长度匹配由 `check_cellbase_structure` 检查。
 - 代表性失败：`OUTPUTS_DATA_LENGTH_MISMATCH`。
 
 #### `check_output_lock_hash_type`
