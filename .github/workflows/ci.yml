@@ -1,0 +1,190 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Tests
+        run: cargo test --all-targets --all-features --locked
+
+  economic-fault-injection:
+    name: Economic fault injection E2E
+    runs-on: ubuntu-24.04
+    needs: rust
+    timeout-minutes: 15
+    env:
+      CKB_VERSION: v0.209.0
+      CKB_ARCHIVE: ckb_v0.209.0_x86_64-unknown-linux-gnu.tar.gz
+      CKB_ARCHIVE_SHA256: cf6766e7ffe8096740f33491748dec14ec5ec302bc7051cdb59996930138cacd
+      CKB_RPC_URL: http://127.0.0.1:8114
+      CKB_ENABLE_POW_CHECK: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build auditor and fault injector
+        run: cargo build --locked --bins
+
+      - name: Download pinned CKB
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 \
+            "https://github.com/nervosnetwork/ckb/releases/download/${CKB_VERSION}/${CKB_ARCHIVE}" \
+            -o "/tmp/${CKB_ARCHIVE}"
+          echo "${CKB_ARCHIVE_SHA256}  /tmp/${CKB_ARCHIVE}" | sha256sum -c -
+          mkdir -p /tmp/ckb-dist
+          tar -xzf "/tmp/${CKB_ARCHIVE}" -C /tmp/ckb-dist
+          CKB_BIN="$(find /tmp/ckb-dist -type f -name ckb -perm -111 | head -n1)"
+          test -n "${CKB_BIN}"
+          echo "CKB_BIN=${CKB_BIN}" >> "$GITHUB_ENV"
+          "${CKB_BIN}" --version
+
+      - name: Initialize isolated dev chain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ckb-dev
+          cd /tmp/ckb-dev
+          "${CKB_BIN}" init \
+            --chain dev \
+            --ba-arg 0x470dcdc5e44064909650113a274b3b36aecb6dc7
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('/tmp/ckb-dev/ckb.toml')
+          text = path.read_text()
+          pattern = re.compile(r'(?m)^modules\s*=\s*\[(.*?)\](?:\s*#.*)?$')
+          match = pattern.search(text)
+          if not match:
+              raise SystemExit('rpc modules line not found in ckb.toml')
+          modules = match.group(1)
+          if '"IntegrationTest"' not in modules:
+              modules = modules.rstrip()
+              if modules:
+                  modules += ', '
+              modules += '"IntegrationTest"'
+              text = text[:match.start()] + f'modules = [{modules}]' + text[match.end():]
+          path.write_text(text)
+          PY
+
+          grep '^modules' ckb.toml
+          grep -q 'IntegrationTest' ckb.toml
+
+      - name: Start CKB dev node
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/ckb-dev
+          "${CKB_BIN}" run > /tmp/ckb-node.log 2>&1 &
+          echo $! > /tmp/ckb-node.pid
+
+          for _ in $(seq 1 60); do
+            if curl -fsS -H 'content-type: application/json' \
+              -d '{"id":1,"jsonrpc":"2.0","method":"get_tip_header","params":[]}' \
+              "${CKB_RPC_URL}" | grep -q '"result"'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/ckb-node.log
+          exit 1
+
+      - name: Inject canonical block with output greater than input
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --locked --bin economic_fault_injection -- "${CKB_RPC_URL}" \
+            | tee /tmp/fault-injection.log
+
+      - name: Verify auditor detects capacity inflation
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f /tmp/audit.jsonl /tmp/auditor.stderr
+
+          target/debug/ckb-block-auditor \
+            --rpc-url "${CKB_RPC_URL}" \
+            --node-id ci-dev-node \
+            --log-path /tmp/audit.jsonl \
+            --poll-interval-ms 200 \
+            --rpc-min-interval-ms 10 \
+            --rpc-max-interval-ms 100 \
+            > /tmp/auditor.stdout 2> /tmp/auditor.stderr &
+          AUDITOR_PID=$!
+
+          found=0
+          for _ in $(seq 1 120); do
+            if test -f /tmp/audit.jsonl \
+              && grep -q '"check_ordinary_capacity_conservation":"FAIL"' /tmp/audit.jsonl \
+              && grep -q 'OUTPUT_CAPACITY_EXCEEDS_INPUT' /tmp/audit.jsonl; then
+              found=1
+              break
+            fi
+            if ! kill -0 "${AUDITOR_PID}" 2>/dev/null; then
+              break
+            fi
+            sleep 0.25
+          done
+
+          kill "${AUDITOR_PID}" 2>/dev/null || true
+          wait "${AUDITOR_PID}" 2>/dev/null || true
+
+          echo '--- fault injection ---'
+          cat /tmp/fault-injection.log || true
+          echo '--- final audit log ---'
+          cat /tmp/audit.jsonl || true
+          echo '--- auditor stderr ---'
+          cat /tmp/auditor.stderr || true
+
+          test "${found}" -eq 1
+          grep -q '"result":"FAIL"' /tmp/audit.jsonl
+          grep -q '"check_ordinary_capacity_conservation":"FAIL"' /tmp/audit.jsonl
+          grep -q 'OUTPUT_CAPACITY_EXCEEDS_INPUT' /tmp/audit.jsonl
+
+      - name: Stop CKB node
+        if: always()
+        shell: bash
+        run: |
+          if test -f /tmp/ckb-node.pid; then
+            kill "$(cat /tmp/ckb-node.pid)" 2>/dev/null || true
+          fi
+
+      - name: Upload E2E logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: economic-fault-injection-logs
+          path: |
+            /tmp/ckb-node.log
+            /tmp/fault-injection.log
+            /tmp/audit.jsonl
+            /tmp/auditor.stdout
+            /tmp/auditor.stderr
+          if-no-files-found: ignore
