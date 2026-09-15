@@ -1672,11 +1672,15 @@ impl<R: CkbRpc> Auditor<R> {
         let emitted_audits =
             EmittedAuditWindow::load(config.log_path.as_deref(), config.history_retention);
         let pending_audits = PendingAuditWindow::new(config.history_retention);
-        let mut header_cache = HeaderCacheState::default();
-        header_cache.capacity = config.header_cache_capacity.max(1);
-        let mut block_cache = BlockCacheState::default();
-        block_cache.max_entries = config.block_cache_entries.max(1);
-        block_cache.max_bytes = config.block_cache_max_bytes.max(1);
+        let header_cache = HeaderCacheState {
+            capacity: config.header_cache_capacity.max(1),
+            ..Default::default()
+        };
+        let block_cache = BlockCacheState {
+            max_entries: config.block_cache_entries.max(1),
+            max_bytes: config.block_cache_max_bytes.max(1),
+            ..Default::default()
+        };
         let now = clock.now();
         Self {
             rpc,
