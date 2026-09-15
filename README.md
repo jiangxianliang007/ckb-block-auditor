@@ -12,6 +12,7 @@ CKB Block Auditor（当前 crate 版本 `0.2.0`）是一个**只读**的 CKB JSO
 - 工作方式：启动时先审计当前 tip；之后轮询并跟随新块。
 - 输出位置：最终审计结果输出到 stdout，或写入 `--log-path` 指定文件；运行中的冷却、重试、pending 诊断始终写到 stderr。
 - 适用场景：节点接入前抽查、线上巡检、区块异常告警、为后续分析保留结构化审计日志。
+- 本工具不是独立的完整共识验证器：不执行脚本，不维护历史 live-cell 状态，也不完整验证 Uncle 或 DAO；局部检查 `PASS` 不能证明区块满足全部共识规则。
 
 ---
 
@@ -160,10 +161,8 @@ cargo build --release --locked
 
 #### `check_block_version`
 
-- 适用：所有区块。
-- 数据来源：块头 `version`、`get_consensus.block_version`。
-- PASS 条件：二者完全相等。
-- 代表性失败：`BLOCK_VERSION_MISMATCH`。
+- 不再强制块头 `version == get_consensus.block_version`：官方 CKB 头部验证器没有此相等约束，不同版本不应因此被判为非法。
+- 为兼容 Rust 日志结构保留字段，但状态固定为 `NotApplicable`，不输出到最终 JSON，也不会因缺少 consensus 而等待该项。
 
 #### `check_block_size`
 
@@ -179,6 +178,7 @@ cargo build --release --locked
 - 数据来源：`block.uncles.len()`、`get_consensus.max_uncles_num`。
 - PASS 条件：`uncles.len() <= max_uncles_num`。
 - 代表性失败：`UNCLE_COUNT_EXCEEDED`。
+- 范围：只验证数量；块体哈希承诺检查也不等于 Uncle 有效性验证。尚未完整检查 Uncle 的 PoW、epoch/难度、祖先关系、重复收录及 proposals 规则。
 
 #### `check_proposal_limit`
 
@@ -242,7 +242,7 @@ cargo build --release --locked
 
 #### `check_cellbase_structure`
 
-- 适用：所有区块。
+- 适用：除 genesis 外的所有区块；genesis 按官方规则豁免该结构检查。
 - 数据来源：区块第一笔交易、其输入/输出/witness。
 - 当前实现同时覆盖以下约束：
   1. 区块必须有第 0 笔交易，否则 `CELLBASE_MISSING`。
@@ -250,17 +250,17 @@ cargo build --release --locked
   3. 除第 0 笔外，后续交易都不能再是 cellbase，否则 `MULTIPLE_CELLBASE_TRANSACTIONS`。
   4. cellbase `outputs.len() <= 1`、`outputs_data.len() <= 1`，且两者长度必须相等；因此它允许**零输出**或**一个输出**，不允许更多输出。
   5. 必须存在第一个输入；该输入 `previous_output` 必须是 null out point，且 `since == block_number`。
-  6. `witnesses.len() == 1`，并且这个 witness 必须能解码成 `CellbaseWitness`。
-  7. 如果存在唯一输出：`type_` 必须为空，`outputs_data[0]` 必须是空字节串。
-- 代表性失败：`CELLBASE_OUTPUT_STRUCTURE_INVALID`、`CELLBASE_PREVIOUS_OUTPUT_NOT_NULL`、`CELLBASE_SINCE_MISMATCH`、`CELLBASE_WITNESS_INVALID`、`CELLBASE_TYPE_SCRIPT_PRESENT`、`CELLBASE_OUTPUT_DATA_NOT_EMPTY`。
+  6. `witnesses.len() == 1`，这个 witness 必须能解码成 `CellbaseWitness`，且其中 lock 的 `hash_type` 必须是 `0、1、2、4` 之一。
+  7. 如果存在唯一输出：`type_` 必须为空，`outputs_data[0]` 必须是空字节串，output lock 的 `hash_type` 也必须是 `0、1、2、4` 之一。
+- 代表性失败：`CELLBASE_OUTPUT_STRUCTURE_INVALID`、`CELLBASE_PREVIOUS_OUTPUT_NOT_NULL`、`CELLBASE_SINCE_MISMATCH`、`CELLBASE_WITNESS_INVALID`、`CELLBASE_OUTPUT_LOCK_INVALID`、`CELLBASE_TYPE_SCRIPT_PRESENT`、`CELLBASE_OUTPUT_DATA_NOT_EMPTY`。
 
-### 5.4 非 cellbase 交易：版本、依赖、输入输出与容量
+### 5.4 交易：版本、依赖、输入输出与容量
 
-以下检查只对**非 cellbase 交易**适用；如果一个区块只有 cellbase，这些字段不会出现在最终 JSON 中。
+版本、重复 cell/header deps 与输出 lock hash_type 检查覆盖**所有交易，包括 cellbase**。其余本节检查仍针对非 cellbase 交易，cellbase 的特殊输入输出结构与奖励分别由专用检查处理；不适用的字段不输出到最终 JSON。
 
 #### `check_transaction_version`
 
-- 数据来源：每笔非 cellbase 交易 `tx.version`、`get_consensus.tx_version`。
+- 数据来源：每笔交易（包括 cellbase）`tx.version`、`get_consensus.tx_version`。
 - PASS 条件：每笔交易的版本都必须与共识版本完全相等。
 - 代表性失败：`TRANSACTION_VERSION_MISMATCH`。
 
@@ -271,14 +271,16 @@ cargo build --release --locked
 
 #### `check_outputs_data_length`
 
-- PASS 条件：每笔非 cellbase 交易都必须满足 `outputs.len() == outputs_data.len()`。
+- PASS 条件：每笔非 cellbase 交易都必须满足 `outputs.len() == outputs_data.len()`；cellbase 的长度匹配由 `check_cellbase_structure` 检查。
 - 代表性失败：`OUTPUTS_DATA_LENGTH_MISMATCH`。
 
 #### `check_output_lock_hash_type`
 
 - 数据来源：每个输出 lock script 的**底层序列化 `hash_type` 字节**。
-- PASS 条件：该字节必须满足 `ScriptHashType::verify_value`；按当前代码与测试，接受值是 `0x01`，或任意偶数字节 `0x00..0xfe`。
-- 适用范围：只检查**非 cellbase 交易输出**的 lock script；不根据 JSON 字符串名猜测，也不执行脚本。
+- PASS 条件：该字节必须属于官方启用集合 `0x00`（Data）、`0x01`（Type）、`0x02`（Data1）、`0x04`（Data2）；拒绝可编码但尚未启用的值，如 `0x06`、`0xfe`。
+- 适用范围：检查**所有交易输出，包括 cellbase** 的 lock script；不根据 JSON 字符串名猜测，也不执行脚本。
+- 若区块内没有任何输出（例如只有零输出 cellbase），本项为 `NotApplicable`，不写入最终 JSON。
+- 本项对齐 CKB v0.209.0 的非上下文检查，不自行添加 epoch 门槛；不代表脚本执行或历史硬分叉上下文已验证。
 - 代表性失败：`OUTPUT_LOCK_HASH_TYPE_INVALID`。
 
 #### `check_duplicate_cell_deps`
@@ -314,6 +316,7 @@ cargo build --release --locked
   3. RPC 返回了完整 JSON 交易体
   4. 用返回交易重算出的 tx hash 必须等于被请求的 hash
 - 这个检查验证的是“引用内容能否被可靠解析并自洽”，不是历史 live-cell 校验。
+- committed 状态来自所连接的 RPC；它不证明源输出在被审计交易执行前尚未消费，也不完整证明来源与当前块的历史先后关系。不能用审计时的 `get_live_cell` 状态替代消费前状态。
 - 代表性失败或未完成：`INPUT_TX_NOT_COMMITTED`、`INPUT_TX_BLOCK_HASH_MISSING`、`INPUT_TX_JSON_MISSING`、`INPUT_TX_HASH_MISMATCH`、`INPUT_TX_MISSING`、`INPUT_TX_RPC_ERROR`。
 
 #### `check_input_output_index`
@@ -339,6 +342,7 @@ cargo build --release --locked
 - 边界说明：
   - 如果任一输入无法解析、源块哈希为全零，或当前实现无法确定输入是否属于 DAO，区块会保留 pending，等待更多数据后再给最终结论。
   - 这里的“ordinary_output_sum”按实现是**全部输出容量之和**，不会再按输出脚本二次分类。
+  - 输出小于输入是允许的，差额可以作为手续费；但输入容量来自内容解析，不保证历史 live 状态，因此此项不能独立发现跨块双花。
 - 代表性失败：`OUTPUT_CAPACITY_EXCEEDS_INPUT`。
 
 ### 5.5 Cellbase reward
@@ -383,6 +387,18 @@ cargo build --release --locked
   - `ordinary_output_sum` 按当前实现仍是**该交易全部输出容量之和**。
 - 代表性失败：`DAO_INPUT_DATA_INVALID`、`DAO_WITHDRAWING_OUTPUT_CAPACITY_MISMATCH`、`DAO_DEPOSIT_HEADER_BLOCK_NUMBER_MISMATCH`、`DAO_WITHDRAW_CAPACITY_EXCEEDED`。
 - 常见未完成原因：`DAO_MAXIMUM_WITHDRAW_MISSING`、`DAO_MAXIMUM_WITHDRAW_RPC_ERROR`、`DAO_DEPOSIT_HEADER_MISSING`、`DAO_WITHDRAW_CAPACITY_INCOMPLETE`、`DAO_CLASSIFICATION_UNKNOWN`。
+- 范围：仅验证容量上限及上述部分结构/关联关系，最大提现容量依赖 RPC 返回值；不执行 DAO 脚本，不完整验证锁定期、`since`、header deps 或历史 live-cell 状态。此项 `PASS` 不等于完整 DAO 验证通过。
+
+### 5.7 规则对照
+
+本次版本与 lock hash_type 修正对照官方 **CKB v0.209.0**：
+
+- [HeaderVerifier](https://github.com/nervosnetwork/ckb/blob/v0.209.0/verification/src/header_verifier.rs)：没有块头版本相等检查。
+- [CellbaseVerifier / NonContextualBlockTxsVerifier](https://github.com/nervosnetwork/ckb/blob/v0.209.0/verification/src/block_verifier.rs)：cellbase witness/output lock 检查，以及覆盖全部交易的通用检查。
+- [交易验证器](https://github.com/nervosnetwork/ckb/blob/v0.209.0/verification/src/transaction_verifier.rs)：交易版本、依赖去重和输出 lock hash_type 检查。
+- [ENABLED_SCRIPT_HASH_TYPE](https://github.com/nervosnetwork/ckb/blob/v0.209.0/util/constant/src/consensus.rs)：允许集合为 `0、1、2、4`，不是所有可编码的偶数字节。
+
+未来升级官方规则时需重新核对该允许集合；以上对照不意味着本工具实现了这些官方验证器的全部能力。
 
 ---
 
