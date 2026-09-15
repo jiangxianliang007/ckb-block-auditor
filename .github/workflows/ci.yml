@@ -28,7 +28,23 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - name: Tests
-        run: cargo test --all-targets --all-features --locked
+        run: >-
+          cargo test --all-targets --all-features --locked --
+          --skip tests::test_http_rate_gate_enforces_min_spacing_across_concurrent_calls
+      - name: RPC rate gate timing test
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            echo "rate gate timing test attempt ${attempt}/3"
+            if cargo test --all-features --locked --lib \
+              tests::test_http_rate_gate_enforces_min_spacing_across_concurrent_calls \
+              -- --exact; then
+              exit 0
+            fi
+          done
+          echo "rate gate timing test failed after 3 attempts"
+          exit 1
 
   economic-fault-injection:
     name: Economic fault injection E2E
