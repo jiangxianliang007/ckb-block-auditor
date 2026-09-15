@@ -33,7 +33,6 @@ jobs:
   economic-fault-injection:
     name: Economic fault injection E2E
     runs-on: ubuntu-24.04
-    needs: rust
     timeout-minutes: 15
     env:
       CKB_VERSION: v0.209.0
