@@ -79,10 +79,7 @@ async fn main() -> Result<()> {
         .checked_add(ONE_CKB)
         .context("capacity overflow while constructing malicious transaction")?;
 
-    let malicious_output = source_output
-        .as_builder()
-        .capacity(output_capacity)
-        .build();
+    let malicious_output = source_output.as_builder().capacity(output_capacity).build();
     let out_point = packed::OutPoint::new(source_tx_packed.calc_tx_hash(), source_index as u32);
     let malicious_tx = TransactionBuilder::default()
         .input(packed::CellInput::new(out_point, 0))
