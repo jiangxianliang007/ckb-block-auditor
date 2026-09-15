@@ -92,6 +92,7 @@ cargo build --release --locked
 | `--block-cache-entries` | `CKB_BLOCK_CACHE_ENTRIES` | `64` | 条 | 只读内存块缓存条目上限（按 hash 键控） |
 | `--block-cache-max-bytes` | `CKB_BLOCK_CACHE_MAX_BYTES` | `67108864` | bytes | 只读内存块缓存总字节上限；超限按旧条目淘汰 |
 | `--stats-interval-secs` | `CKB_STATS_INTERVAL_SECS` | `60` | s | stderr 运行统计输出间隔（HTTP 尝试/429/缓存命中/进度） |
+| `--enable-pow-check` | `CKB_ENABLE_POW_CHECK` | `true` | bool | 是否启用 `check_pow`（Eaglesong PoW 阈值校验） |
 | `--dao-type-hash` | `CKB_DAO_TYPE_HASH` | 空字符串 | hash | 可选启动保护：若配置，必须与 `get_consensus.dao_type_hash` 一致 |
 | `--median-time-span` | `CKB_MEDIAN_TIME_SPAN` | `11` | - | 当前仅解析参数；已实现时间戳检查实际使用 `get_consensus.median_time_block_count` |
 | `--proposal-limit` | `CKB_PROPOSAL_LIMIT` | `1500` | - | 当前仅解析参数；已实现提案上限检查实际使用 `get_consensus.max_block_proposals_limit` |
@@ -180,6 +181,13 @@ cargo build --release --locked
 - 代表性失败：`UNCLE_COUNT_EXCEEDED`。
 - 范围：只验证数量；块体哈希承诺检查也不等于 Uncle 有效性验证。尚未完整检查 Uncle 的 PoW、epoch/难度、祖先关系、重复收录及 proposals 规则。
 
+#### `check_uncle_hashes`
+
+- 适用：所有区块。
+- 数据来源：区块内每个 uncle header。
+- PASS 条件：逐个 uncle 重算 `header hash`，必须与该 uncle 声明的 `header.hash` 一致。
+- 代表性失败：`UNCLE_HASH_MISMATCH`。
+
 #### `check_proposal_limit`
 
 - 适用：所有区块。
@@ -195,6 +203,13 @@ cargo build --release --locked
 - 数据来源：当前块头本身。
 - PASS 条件：重新计算 header hash 后，必须等于 RPC 返回的 `block.hash`。
 - 代表性失败：`BLOCK_HASH_MISMATCH`。
+
+#### `check_pow`
+
+- 适用：所有区块。
+- 数据来源：`header.raw.calc_pow_hash()`、`header.nonce`、`header.compact_target`。
+- 判据：将 `pow_hash(32 bytes)` 与 `nonce(16 bytes little-endian)` 拼成 48 bytes，做 Eaglesong 哈希，再将结果按大端解释为 `U256`；同时把 `compact_target` 解码为 `U256 target`，要求 `pow_hash <= target`。
+- 代表性失败：`POW_TARGET_INVALID`、`POW_INVALID`。
 
 #### `check_transaction_hashes`
 

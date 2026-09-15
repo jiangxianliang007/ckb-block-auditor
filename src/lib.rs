@@ -17,9 +17,12 @@ use ckb_jsonrpc_types::{
 };
 use ckb_occupied_capacity::Capacity as OccupiedCapacity;
 use ckb_types::H256;
+use ckb_types::U256;
 use ckb_types::core::{BlockView as CoreBlockView, EpochNumberWithFraction};
 use ckb_types::packed;
 use ckb_types::prelude::*;
+use ckb_types::utilities::compact_to_target;
+use eaglesong::eaglesong;
 use reqwest::header::RETRY_AFTER;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -62,6 +65,7 @@ pub struct AuditorConfig {
     pub block_cache_entries: usize,
     pub block_cache_max_bytes: usize,
     pub stats_interval_secs: u64,
+    pub enable_pow_check: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -700,7 +704,11 @@ pub struct AuditLog {
     #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_uncle_count_limit: CheckStatus,
     #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
+    pub check_uncle_hashes: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_proposal_limit: CheckStatus,
+    #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
+    pub check_pow: CheckStatus,
     #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
     pub check_block_hash: CheckStatus,
     #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
@@ -783,7 +791,9 @@ impl AuditLog {
             check_block_version: CheckStatus::NotApplicable,
             check_block_size: CheckStatus::Unknown,
             check_uncle_count_limit: CheckStatus::Unknown,
+            check_uncle_hashes: CheckStatus::Unknown,
             check_proposal_limit: CheckStatus::Unknown,
+            check_pow: CheckStatus::Unknown,
             check_block_hash: CheckStatus::Unknown,
             check_transaction_hashes: CheckStatus::Unknown,
             check_transactions_root: CheckStatus::Unknown,
@@ -837,7 +847,9 @@ impl AuditLog {
             ("check_block_version", self.check_block_version),
             ("check_block_size", self.check_block_size),
             ("check_uncle_count_limit", self.check_uncle_count_limit),
+            ("check_uncle_hashes", self.check_uncle_hashes),
             ("check_proposal_limit", self.check_proposal_limit),
+            ("check_pow", self.check_pow),
             ("check_block_hash", self.check_block_hash),
             ("check_transaction_hashes", self.check_transaction_hashes),
             ("check_transactions_root", self.check_transactions_root),
@@ -986,7 +998,9 @@ impl AuditLog {
             ("check_block_version", self.check_block_version),
             ("check_block_size", self.check_block_size),
             ("check_uncle_count_limit", self.check_uncle_count_limit),
+            ("check_uncle_hashes", self.check_uncle_hashes),
             ("check_proposal_limit", self.check_proposal_limit),
+            ("check_pow", self.check_pow),
             ("check_block_hash", self.check_block_hash),
             ("check_transaction_hashes", self.check_transaction_hashes),
             ("check_transactions_root", self.check_transactions_root),
@@ -1054,7 +1068,9 @@ impl AuditLog {
             &mut self.check_timestamp,
             &mut self.check_block_size,
             &mut self.check_uncle_count_limit,
+            &mut self.check_uncle_hashes,
             &mut self.check_proposal_limit,
+            &mut self.check_pow,
             &mut self.check_block_hash,
             &mut self.check_transaction_hashes,
             &mut self.check_transactions_root,
@@ -2174,10 +2190,16 @@ impl<R: CkbRpc> Auditor<R> {
                 .is_some_and(|saved| !saved.eq_ignore_ascii_case(&hash))
             {
                 eprintln!(
-                    "pending retry block changed on canonical chain at height {}: old={} new={}",
-                    height,
-                    pending_hash.unwrap_or_default(),
-                    hash
+                    "{}",
+                    json!({
+                        "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                        "service": "ckb-block-auditor",
+                        "event_type": "pending_block_changed",
+                        "node_id": self.config.node_id.clone(),
+                        "block_height": height,
+                        "old_block_hash": pending_hash.clone().unwrap_or_default(),
+                        "new_block_hash": hash.clone(),
+                    })
                 );
             }
             if completed {
@@ -2242,8 +2264,17 @@ impl<R: CkbRpc> Auditor<R> {
         }
 
         eprintln!(
-            "reorg detected at height {}, old={}, new={:#x}",
-            state.last_height, state.last_hash, current.hash
+            "{}",
+            json!({
+                "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                "service": "ckb-block-auditor",
+                "event_type": "reorg_detected",
+                "node_id": self.config.node_id.clone(),
+                "block_height": state.last_height,
+                "old_block_hash": state.last_hash,
+                "new_block_hash": format!("{:#x}", current.hash),
+                "history_retention": self.config.history_retention,
+            })
         );
         let mut heights: Vec<u64> = state.history.keys().copied().collect();
         heights.sort_by(|a, b| b.cmp(a));
@@ -2260,8 +2291,16 @@ impl<R: CkbRpc> Auditor<R> {
         }
 
         eprintln!(
-            "reorg deeper than retention ({}), anchoring to current tip on next poll",
-            self.config.history_retention
+            "{}",
+            json!({
+                "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                "service": "ckb-block-auditor",
+                "event_type": "reorg_beyond_retention",
+                "node_id": self.config.node_id.clone(),
+                "block_height": state.last_height,
+                "history_retention": self.config.history_retention,
+                "action": "anchor_to_tip_minus_one",
+            })
         );
         Ok(self
             .rpc
@@ -2382,7 +2421,9 @@ impl<R: CkbRpc> Auditor<R> {
             ("check_block_version", log.check_block_version),
             ("check_block_size", log.check_block_size),
             ("check_uncle_count_limit", log.check_uncle_count_limit),
+            ("check_uncle_hashes", log.check_uncle_hashes),
             ("check_proposal_limit", log.check_proposal_limit),
+            ("check_pow", log.check_pow),
             ("check_block_hash", log.check_block_hash),
             ("check_transaction_hashes", log.check_transaction_hashes),
             ("check_transactions_root", log.check_transactions_root),
@@ -2836,6 +2877,47 @@ impl<R: CkbRpc> Auditor<R> {
 
         let block_data: packed::Block = core_block.data();
         let actual_block_size = block_data.serialized_size_without_uncle_proposals();
+        let mut uncle_hashes_ok = true;
+        for (uncle_index, uncle) in core_block.uncles().into_iter().enumerate() {
+            let computed_uncle_hash: H256 = uncle.data().header().calc_header_hash().unpack();
+            let rpc_uncle_hash = block
+                .uncles
+                .get(uncle_index)
+                .map(|item| item.header.hash.clone())
+                .unwrap_or_default();
+            if computed_uncle_hash != rpc_uncle_hash {
+                uncle_hashes_ok = false;
+                log.push_detail(
+                    &self.config,
+                    DetailItem {
+                        check_name: "check_uncle_hashes".to_string(),
+                        status: CheckStatus::Fail,
+                        error_code: "UNCLE_HASH_MISMATCH".to_string(),
+                        failure_kind: None,
+                        rpc_method: None,
+                        attempts: None,
+                        max_retries: None,
+                        tx_hash: None,
+                        tx_index: None,
+                        input_index: None,
+                        output_index: Some(uncle_index),
+                        referenced_out_point: None,
+                        expected_operator: Some("equal".to_string()),
+                        expected_value: Some(format!("{rpc_uncle_hash:#x}")),
+                        actual_value: Some(format!("{computed_uncle_hash:#x}")),
+                        unit: Some("hash".to_string()),
+                        reason:
+                            "recomputed uncle header hash does not match the rpc-provided uncle hash"
+                                .to_string(),
+                    },
+                );
+            }
+        }
+        log.check_uncle_hashes = if uncle_hashes_ok {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Fail
+        };
         if let Some(consensus) = consensus {
             let actual_uncle_count = block.uncles.len();
             log.check_uncle_count_limit = if actual_uncle_count <= consensus.max_uncles_num {
@@ -2927,6 +3009,73 @@ impl<R: CkbRpc> Auditor<R> {
             log.check_uncle_count_limit = CheckStatus::Unknown;
             log.check_proposal_limit = CheckStatus::Unknown;
         };
+
+        if self.config.enable_pow_check {
+            let pow_hash = core_block.data().header().raw().calc_pow_hash();
+            let nonce = block.header.inner.nonce.value();
+            let mut pow_input = [0u8; 48];
+            pow_input[..32].copy_from_slice(pow_hash.as_slice());
+            pow_input[32..].copy_from_slice(&nonce.to_le_bytes());
+            let mut pow_output = [0u8; 32];
+            eaglesong(&pow_input, &mut pow_output);
+            let (target, overflow) = compact_to_target(block.header.inner.compact_target.value());
+            if target.is_zero() || overflow {
+                log.check_pow = CheckStatus::Fail;
+                log.push_detail(
+                    &self.config,
+                    DetailItem {
+                        check_name: "check_pow".to_string(),
+                        status: CheckStatus::Fail,
+                        error_code: "POW_TARGET_INVALID".to_string(),
+                        failure_kind: None,
+                        rpc_method: None,
+                        attempts: None,
+                        max_retries: None,
+                        tx_hash: None,
+                        tx_index: None,
+                        input_index: None,
+                        output_index: None,
+                        referenced_out_point: None,
+                        expected_operator: Some("valid_target".to_string()),
+                        expected_value: Some("target>0 and no compact overflow".to_string()),
+                        actual_value: Some(format!("target={:#x} overflow={overflow}", target)),
+                        unit: None,
+                        reason: "compact_target decoded to an invalid PoW target".to_string(),
+                    },
+                );
+            } else {
+                let pow_u256 = U256::from_big_endian(&pow_output).expect("pow output length is 32");
+                if pow_u256 <= target {
+                    log.check_pow = CheckStatus::Pass;
+                } else {
+                    log.check_pow = CheckStatus::Fail;
+                    log.push_detail(
+                        &self.config,
+                        DetailItem {
+                            check_name: "check_pow".to_string(),
+                            status: CheckStatus::Fail,
+                            error_code: "POW_INVALID".to_string(),
+                            failure_kind: None,
+                            rpc_method: None,
+                            attempts: None,
+                            max_retries: None,
+                            tx_hash: None,
+                            tx_index: None,
+                            input_index: None,
+                            output_index: None,
+                            referenced_out_point: None,
+                            expected_operator: Some("less_than_or_equal".to_string()),
+                            expected_value: Some(format!("{:#x}", target)),
+                            actual_value: Some(format!("{:#x}", pow_u256)),
+                            unit: Some("pow".to_string()),
+                            reason: "pow hash is above the compact_target threshold".to_string(),
+                        },
+                    );
+                }
+            }
+        } else {
+            log.check_pow = CheckStatus::NotApplicable;
+        }
 
         let computed_header_hash: H256 = core_block.data().header().calc_header_hash().unpack();
         log.check_block_hash = if computed_header_hash == block.header.hash {
@@ -5654,6 +5803,7 @@ mod tests {
             block_cache_entries: 64,
             block_cache_max_bytes: 64 * 1024 * 1024,
             stats_interval_secs: 60,
+            enable_pow_check: false,
         }
     }
 
@@ -8706,5 +8856,86 @@ mod tests {
                 .iter()
                 .any(|detail| detail.error_code == "UNCLE_COUNT_EXCEEDED")
         );
+    }
+
+    #[tokio::test]
+    async fn test_uncle_hash_check_detects_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path().join("cursor.json"));
+        let uncle_source = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(7u64)
+                    .epoch(EpochNumberWithFraction::new(0, 7, 1000).full_value())
+                    .build(),
+            )
+            .build();
+        let block = BlockBuilder::default()
+            .header(HeaderBuilder::default().number(0u64).build())
+            .uncle(uncle_source.as_uncle())
+            .transaction(empty_cellbase(0))
+            .build();
+        let mut block_json: BlockView = block.clone().into();
+        block_json.uncles[0].header.hash = H256::from([9u8; 32]);
+        let core_block: CoreBlockView = block;
+        let rpc = Arc::new(MockRpc::default());
+        let auditor = Auditor::new(rpc, cfg.clone());
+        let consensus = ConsensusSnapshot::from_rpc(&cfg, mock_consensus()).unwrap();
+        let mut log = AuditLog::new(&cfg, &block_json);
+        auditor
+            .audit_header_and_block(&block_json, &core_block, &mut log, Some(&consensus))
+            .await;
+        assert_eq!(log.check_uncle_hashes, CheckStatus::Fail);
+        assert!(log.details.as_ref().unwrap().iter().any(|detail| {
+            detail.check_name == "check_uncle_hashes" && detail.error_code == "UNCLE_HASH_MISMATCH"
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_pow_check_target_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().join("cursor.json"));
+        cfg.enable_pow_check = true;
+        let rpc = Arc::new(MockRpc::default());
+        let auditor = Auditor::new(rpc, cfg.clone());
+        let consensus = ConsensusSnapshot::from_rpc(&cfg, mock_consensus()).unwrap();
+
+        let easy_target_compact =
+            ckb_types::utilities::target_to_compact(ckb_types::U256::max_value());
+        let easy_block = BlockBuilder::default()
+            .header(
+                HeaderBuilder::default()
+                    .number(0u64)
+                    .compact_target(easy_target_compact)
+                    .build(),
+            )
+            .transaction(empty_cellbase(0))
+            .build();
+        let easy_json: BlockView = easy_block.clone().into();
+        let mut easy_log = AuditLog::new(&cfg, &easy_json);
+        auditor
+            .audit_header_and_block(&easy_json, &easy_block, &mut easy_log, Some(&consensus))
+            .await;
+        assert_eq!(easy_log.check_pow, CheckStatus::Pass);
+
+        let invalid_target_block = BlockBuilder::default()
+            .header(HeaderBuilder::default().number(0u64).build())
+            .transaction(empty_cellbase(0))
+            .build();
+        let mut invalid_json: BlockView = invalid_target_block.clone().into();
+        invalid_json.header.inner.compact_target = 0u32.into();
+        let mut invalid_log = AuditLog::new(&cfg, &invalid_json);
+        auditor
+            .audit_header_and_block(
+                &invalid_json,
+                &invalid_target_block,
+                &mut invalid_log,
+                Some(&consensus),
+            )
+            .await;
+        assert_eq!(invalid_log.check_pow, CheckStatus::Fail);
+        assert!(invalid_log.details.as_ref().unwrap().iter().any(|detail| {
+            detail.check_name == "check_pow" && detail.error_code == "POW_TARGET_INVALID"
+        }));
     }
 }
