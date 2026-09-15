@@ -38,6 +38,10 @@ const PENDING_LOG_REMINDER_ROUNDS: u32 = 10;
 const PENDING_EXECUTION_BACKOFF_FLOOR_SECS: u64 = 15;
 const PENDING_EXECUTION_BACKOFF_CAP_SECS: u64 = 300;
 
+fn is_enabled_script_hash_type(hash_type: u8) -> bool {
+    matches!(hash_type, 0 | 1 | 2 | 4)
+}
+
 #[derive(Debug, Clone)]
 pub struct AuditorConfig {
     pub rpc_url: String,
@@ -608,7 +612,6 @@ struct ConsensusSnapshot {
     max_block_bytes: usize,
     max_uncles_num: usize,
     proposal_limit: usize,
-    block_version: u32,
     tx_version: u32,
     median_time_block_count: usize,
     finalization_delay_length: u64,
@@ -637,7 +640,6 @@ impl ConsensusSnapshot {
                 .context("consensus max_uncles_num exceeds platform usize")?,
             proposal_limit: usize::try_from(consensus.max_block_proposals_limit.value())
                 .context("consensus max_block_proposals_limit exceeds platform usize")?,
-            block_version: consensus.block_version.value(),
             tx_version: consensus.tx_version.value(),
             median_time_block_count: usize::try_from(consensus.median_time_block_count.value())
                 .context("consensus median_time_block_count exceeds platform usize")?,
@@ -778,7 +780,7 @@ impl AuditLog {
             check_parent_hash: CheckStatus::Unknown,
             check_epoch_continuity: CheckStatus::Unknown,
             check_timestamp: CheckStatus::Unknown,
-            check_block_version: CheckStatus::Unknown,
+            check_block_version: CheckStatus::NotApplicable,
             check_block_size: CheckStatus::Unknown,
             check_uncle_count_limit: CheckStatus::Unknown,
             check_proposal_limit: CheckStatus::Unknown,
@@ -1050,7 +1052,6 @@ impl AuditLog {
             &mut self.check_parent_hash,
             &mut self.check_epoch_continuity,
             &mut self.check_timestamp,
-            &mut self.check_block_version,
             &mut self.check_block_size,
             &mut self.check_uncle_count_limit,
             &mut self.check_proposal_limit,
@@ -2518,7 +2519,6 @@ impl<R: CkbRpc> Auditor<R> {
         let reason = format!("get_consensus unavailable: {err}");
         for check_name in [
             "check_timestamp",
-            "check_block_version",
             "check_block_size",
             "check_uncle_count_limit",
             "check_proposal_limit",
@@ -2837,35 +2837,6 @@ impl<R: CkbRpc> Auditor<R> {
         let block_data: packed::Block = core_block.data();
         let actual_block_size = block_data.serialized_size_without_uncle_proposals();
         if let Some(consensus) = consensus {
-            let actual_block_version = block.header.inner.version.value();
-            log.check_block_version = if actual_block_version == consensus.block_version {
-                CheckStatus::Pass
-            } else {
-                log.push_detail(
-                    &self.config,
-                    DetailItem {
-                        check_name: "check_block_version".to_string(),
-                        status: CheckStatus::Fail,
-                        error_code: "BLOCK_VERSION_MISMATCH".to_string(),
-                        failure_kind: None,
-                        rpc_method: None,
-                        attempts: None,
-                        max_retries: None,
-                        tx_hash: None,
-                        tx_index: None,
-                        input_index: None,
-                        output_index: None,
-                        referenced_out_point: None,
-                        expected_operator: Some("equal".to_string()),
-                        expected_value: Some(consensus.block_version.to_string()),
-                        actual_value: Some(actual_block_version.to_string()),
-                        unit: Some("version".to_string()),
-                        reason: "block version does not match the consensus block_version"
-                            .to_string(),
-                    },
-                );
-                CheckStatus::Fail
-            };
             let actual_uncle_count = block.uncles.len();
             log.check_uncle_count_limit = if actual_uncle_count <= consensus.max_uncles_num {
                 CheckStatus::Pass
@@ -2952,7 +2923,6 @@ impl<R: CkbRpc> Auditor<R> {
                 CheckStatus::Fail
             };
         } else {
-            log.check_block_version = CheckStatus::Unknown;
             log.check_block_size = CheckStatus::Unknown;
             log.check_uncle_count_limit = CheckStatus::Unknown;
             log.check_proposal_limit = CheckStatus::Unknown;
@@ -3197,6 +3167,10 @@ impl<R: CkbRpc> Auditor<R> {
     }
 
     fn check_cellbase_structure(&self, block: &BlockView, log: &mut AuditLog) {
+        if block.header.inner.number.value() == 0 {
+            log.check_cellbase_structure = CheckStatus::NotApplicable;
+            return;
+        }
         let mut status = CheckStatus::Pass;
         let Some(first_tx) = block.transactions.first() else {
             log.push_detail(
@@ -3425,7 +3399,8 @@ impl<R: CkbRpc> Auditor<R> {
         }
 
         if let Some(witness) = first_tx.inner.witnesses.first()
-            && packed::CellbaseWitness::from_slice(witness.as_bytes()).is_err()
+            && !packed::CellbaseWitness::from_slice(witness.as_bytes())
+                .is_ok_and(|witness| is_enabled_script_hash_type(witness.lock().hash_type().into()))
         {
             status = CheckStatus::Fail;
             log.push_detail(
@@ -3447,9 +3422,43 @@ impl<R: CkbRpc> Auditor<R> {
                     expected_value: None,
                     actual_value: None,
                     unit: None,
-                    reason: "cellbase witness cannot be decoded".to_string(),
+                    reason:
+                        "cellbase witness cannot be decoded or its lock hash_type is not enabled"
+                            .to_string(),
                 },
             );
+        }
+
+        for (output_index, output) in first_tx.inner.outputs.iter().enumerate() {
+            let hash_type: u8 = packed::CellOutput::from(output.clone())
+                .lock()
+                .hash_type()
+                .into();
+            if !is_enabled_script_hash_type(hash_type) {
+                status = CheckStatus::Fail;
+                log.push_detail(
+                    &self.config,
+                    DetailItem {
+                        check_name: "check_cellbase_structure".to_string(),
+                        status,
+                        error_code: "CELLBASE_OUTPUT_LOCK_INVALID".to_string(),
+                        failure_kind: None,
+                        rpc_method: None,
+                        attempts: None,
+                        max_retries: None,
+                        tx_hash: Some(format!("{:#x}", first_tx.hash)),
+                        tx_index: Some(0),
+                        input_index: None,
+                        output_index: Some(output_index),
+                        referenced_out_point: None,
+                        expected_operator: Some("enabled_hash_type".to_string()),
+                        expected_value: Some("0x00, 0x01, 0x02, or 0x04".to_string()),
+                        actual_value: Some(format!("0x{hash_type:02x}")),
+                        unit: Some("hash_type".to_string()),
+                        reason: "cellbase output lock hash_type is not enabled".to_string(),
+                    },
+                );
+            }
         }
 
         if let Some(output) = first_tx.inner.outputs.first()
@@ -3937,21 +3946,15 @@ impl<R: CkbRpc> Auditor<R> {
 
         for (tx_index, tx) in block.transactions.iter().enumerate() {
             let packed_tx: packed::Transaction = tx.inner.clone().into();
-            if packed_tx.is_cellbase() {
-                continue;
-            }
+            let is_cellbase = packed_tx.is_cellbase();
 
             overall_tx_version = merge_status(overall_tx_version, CheckStatus::Pass);
-            overall_struct = merge_status(overall_struct, CheckStatus::Pass);
-            overall_data_len = merge_status(overall_data_len, CheckStatus::Pass);
-            overall_lock_hash_type = merge_status(overall_lock_hash_type, CheckStatus::Pass);
             overall_dup_cell_dep = merge_status(overall_dup_cell_dep, CheckStatus::Pass);
             overall_dup_header_dep = merge_status(overall_dup_header_dep, CheckStatus::Pass);
-            overall_dup_input_tx = merge_status(overall_dup_input_tx, CheckStatus::Pass);
-            overall_dup_input_block = merge_status(overall_dup_input_block, CheckStatus::Pass);
-            overall_input_resolution = merge_status(overall_input_resolution, CheckStatus::Pass);
-            overall_input_index = merge_status(overall_input_index, CheckStatus::Pass);
-            overall_occupied_capacity = merge_status(overall_occupied_capacity, CheckStatus::Pass);
+            if !is_cellbase {
+                overall_struct = merge_status(overall_struct, CheckStatus::Pass);
+                overall_data_len = merge_status(overall_data_len, CheckStatus::Pass);
+            }
 
             if let Some(consensus) = consensus {
                 if tx.inner.version.value() != consensus.tx_version {
@@ -3984,7 +3987,7 @@ impl<R: CkbRpc> Auditor<R> {
                 overall_tx_version = merge_status(overall_tx_version, CheckStatus::Unknown);
             }
 
-            if tx.inner.inputs.is_empty() || tx.inner.outputs.is_empty() {
+            if !is_cellbase && (tx.inner.inputs.is_empty() || tx.inner.outputs.is_empty()) {
                 overall_struct = merge_status(overall_struct, CheckStatus::Fail);
                 log.push_detail(
                     &self.config,
@@ -4015,7 +4018,7 @@ impl<R: CkbRpc> Auditor<R> {
                 );
             }
 
-            if tx.inner.outputs.len() != tx.inner.outputs_data.len() {
+            if !is_cellbase && tx.inner.outputs.len() != tx.inner.outputs_data.len() {
                 overall_data_len = merge_status(overall_data_len, CheckStatus::Fail);
                 log.push_detail(
                     &self.config,
@@ -4108,6 +4111,51 @@ impl<R: CkbRpc> Auditor<R> {
                 );
             }
 
+            for (output_index, output) in tx.inner.outputs.iter().enumerate() {
+                overall_lock_hash_type = merge_status(overall_lock_hash_type, CheckStatus::Pass);
+                let lock_hash_type_raw: u8 = packed::CellOutput::from(output.clone())
+                    .lock()
+                    .hash_type()
+                    .into();
+                if !is_enabled_script_hash_type(lock_hash_type_raw) {
+                    overall_lock_hash_type =
+                        merge_status(overall_lock_hash_type, CheckStatus::Fail);
+                    log.push_detail(
+                        &self.config,
+                        DetailItem {
+                            check_name: "check_output_lock_hash_type".to_string(),
+                            status: CheckStatus::Fail,
+                            error_code: "OUTPUT_LOCK_HASH_TYPE_INVALID".to_string(),
+                            failure_kind: None,
+                            rpc_method: None,
+                            attempts: None,
+                            max_retries: None,
+                            tx_hash: Some(format!("{:#x}", tx.hash)),
+                            tx_index: Some(tx_index),
+                            input_index: None,
+                            output_index: Some(output_index),
+                            referenced_out_point: None,
+                            expected_operator: Some("enabled_hash_type".to_string()),
+                            expected_value: Some("0x00, 0x01, 0x02, or 0x04".to_string()),
+                            actual_value: Some(format!("0x{lock_hash_type_raw:02x}")),
+                            unit: Some("hash_type".to_string()),
+                            reason: "output lock script hash_type is not enabled by CKB consensus"
+                                .to_string(),
+                        },
+                    );
+                }
+            }
+
+            if is_cellbase {
+                continue;
+            }
+
+            overall_dup_input_tx = merge_status(overall_dup_input_tx, CheckStatus::Pass);
+            overall_dup_input_block = merge_status(overall_dup_input_block, CheckStatus::Pass);
+            overall_input_resolution = merge_status(overall_input_resolution, CheckStatus::Pass);
+            overall_input_index = merge_status(overall_input_index, CheckStatus::Pass);
+            overall_occupied_capacity = merge_status(overall_occupied_capacity, CheckStatus::Pass);
+
             let mut input_set = HashSet::new();
             if tx.inner.inputs.iter().any(|input| {
                 let key = format!(
@@ -4184,39 +4232,6 @@ impl<R: CkbRpc> Auditor<R> {
             let mut dao_effective_sum: u128 = 0;
 
             for (output_index, output) in tx.inner.outputs.iter().enumerate() {
-                let lock_hash_type_raw: u8 = packed::CellOutput::from(output.clone())
-                    .lock()
-                    .hash_type()
-                    .into();
-                if !ckb_types::core::ScriptHashType::verify_value(lock_hash_type_raw) {
-                    overall_lock_hash_type =
-                        merge_status(overall_lock_hash_type, CheckStatus::Fail);
-                    log.push_detail(
-                        &self.config,
-                        DetailItem {
-                            check_name: "check_output_lock_hash_type".to_string(),
-                            status: CheckStatus::Fail,
-                            error_code: "OUTPUT_LOCK_HASH_TYPE_INVALID".to_string(),
-                            failure_kind: None,
-                            rpc_method: None,
-                            attempts: None,
-                            max_retries: None,
-                            tx_hash: Some(format!("{:#x}", tx.hash)),
-                            tx_index: Some(tx_index),
-                            input_index: None,
-                            output_index: Some(output_index),
-                            referenced_out_point: None,
-                            expected_operator: Some("valid_encoding".to_string()),
-                            expected_value: Some(
-                                "0x01 or any even byte in [0x00,0xfe]".to_string(),
-                            ),
-                            actual_value: Some(format!("0x{lock_hash_type_raw:02x}")),
-                            unit: Some("hash_type".to_string()),
-                            reason: "output lock script hash_type encoding is not allowed by CKB consensus"
-                                .to_string(),
-                        },
-                    );
-                }
                 ordinary_output_sum = match ordinary_output_sum
                     .checked_add(output.capacity.value() as u128)
                 {
@@ -7742,7 +7757,7 @@ mod tests {
             .output_data(ckb_types::bytes::Bytes::new())
             .build();
         let spend_tx = TransactionBuilder::default()
-            .version(0u32)
+            .version(1u32)
             .input(CellInput::new(PackedOutPoint::new(prev_tx.hash(), 0), 0))
             .output(simple_cell_output(10_000_000_000))
             .output_data(ckb_types::bytes::Bytes::new())
@@ -7811,7 +7826,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|item| item == "check_block_version")
+                .any(|item| item == "check_transaction_version")
         );
     }
 
@@ -7982,6 +7997,7 @@ mod tests {
         let value = serde_json::to_value(&log).unwrap();
         assert_eq!(value["schema_version"], 4);
         assert!(value.get("check_block_height").is_some());
+        assert!(value.get("check_block_version").is_none());
         assert!(value.get("check_cellbase_reward_amount").is_some());
         assert!(value.get("check_dao_withdraw_capacity").is_none());
         assert!(value.get("network").is_none());
@@ -7993,7 +8009,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_output_lock_hash_type_accepts_all_consensus_encodings() {
+    async fn test_output_lock_hash_type_accepts_enabled_types() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(dir.path().join("cursor.json"));
         let parent = HeaderBuilder::default()
@@ -8009,19 +8025,7 @@ mod tests {
         let mut spend_builder = TransactionBuilder::default()
             .version(0u32)
             .input(CellInput::new(PackedOutPoint::new(prev_tx.hash(), 0), 0));
-        spend_builder = spend_builder
-            .output(
-                CellOutput::new_builder()
-                    .capacity(10_000_000_000u64)
-                    .lock(lock_script_with_raw_hash_type(0, 1))
-                    .type_(ScriptOpt::default())
-                    .build(),
-            )
-            .output_data(ckb_types::bytes::Bytes::new());
-        for hash_type in 0u8..=254 {
-            if !ckb_types::core::ScriptHashType::verify_value(hash_type) || hash_type == 1 {
-                continue;
-            }
+        for hash_type in [0, 1, 2, 4] {
             spend_builder = spend_builder
                 .output(
                     CellOutput::new_builder()
@@ -8059,6 +8063,258 @@ mod tests {
             .audit_transactions(&block_json, &core_block, &mut log, Some(&consensus))
             .await;
         assert_eq!(log.check_output_lock_hash_type, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn test_enabled_script_hash_types_exclude_reserved_encodings() {
+        for hash_type in 0..=u8::MAX {
+            assert_eq!(
+                is_enabled_script_hash_type(hash_type),
+                [0, 1, 2, 4].contains(&hash_type),
+                "hash_type={hash_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cellbase_witness_lock_hash_types_and_genesis_exemption() {
+        let cfg = test_config(PathBuf::from("cursor.json"));
+        let auditor = Auditor::new(Arc::new(MockRpc::default()), cfg.clone());
+        for height in [0, 1] {
+            for hash_type in [0, 1, 2, 4, 6, 254, 3, 255] {
+                let cellbase = TransactionBuilder::default()
+                    .input(CellInput::new_cellbase_input(height))
+                    .witness(lock_script_with_raw_hash_type(0, hash_type).into_witness())
+                    .build();
+                let block: BlockView = BlockBuilder::default()
+                    .header(
+                        HeaderBuilder::default()
+                            .number(height)
+                            .epoch(EpochNumberWithFraction::new(0, height, 1000).full_value())
+                            .build(),
+                    )
+                    .transaction(cellbase)
+                    .build()
+                    .into();
+                let mut log = AuditLog::new(&cfg, &block);
+                auditor.check_cellbase_structure(&block, &mut log);
+                let expected = if height == 0 {
+                    CheckStatus::NotApplicable
+                } else if [0, 1, 2, 4].contains(&hash_type) {
+                    CheckStatus::Pass
+                } else {
+                    CheckStatus::Fail
+                };
+                assert_eq!(
+                    log.check_cellbase_structure, expected,
+                    "height={height} witness hash_type={hash_type}"
+                );
+                if expected == CheckStatus::Fail {
+                    assert!(log.details.as_ref().unwrap().iter().any(|detail| {
+                        detail.error_code == "CELLBASE_WITNESS_INVALID"
+                            && detail.tx_index == Some(0)
+                    }));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_output_lock_hash_types_include_cellbase_and_reject_reserved_types() {
+        let cfg = test_config(PathBuf::from("cursor.json"));
+        let auditor = Auditor::new(Arc::new(MockRpc::default()), cfg.clone());
+        let consensus = ConsensusSnapshot::from_rpc(&cfg, mock_consensus()).unwrap();
+        for height in [0, 1] {
+            for is_cellbase in [false, true] {
+                for hash_type in [0, 1, 2, 4, 6, 254] {
+                    let input = if is_cellbase {
+                        CellInput::new_cellbase_input(height)
+                    } else {
+                        CellInput::new(PackedOutPoint::new(Byte32::new([1; 32]), 0), 0)
+                    };
+                    let tx = TransactionBuilder::default()
+                        .input(input)
+                        .witness(simple_lock_script().into_witness())
+                        .output(
+                            CellOutput::new_builder()
+                                .capacity(10_000_000_000u64)
+                                .lock(lock_script_with_raw_hash_type(0, hash_type))
+                                .build(),
+                        )
+                        .output_data(ckb_types::bytes::Bytes::new())
+                        .build();
+                    let block = BlockBuilder::default()
+                        .header(
+                            HeaderBuilder::default()
+                                .number(height)
+                                .epoch(EpochNumberWithFraction::new(0, height, 1000).full_value())
+                                .build(),
+                        )
+                        .transaction(tx)
+                        .build();
+                    let block_json: BlockView = block.clone().into();
+                    for available_consensus in [None, Some(&consensus)] {
+                        let mut log = AuditLog::new(&cfg, &block_json);
+                        auditor
+                            .audit_transactions(&block_json, &block, &mut log, available_consensus)
+                            .await;
+                        let expected = if [0, 1, 2, 4].contains(&hash_type) {
+                            CheckStatus::Pass
+                        } else {
+                            CheckStatus::Fail
+                        };
+                        assert_eq!(
+                            log.check_output_lock_hash_type, expected,
+                            "height={height} cellbase={is_cellbase} hash_type={hash_type}"
+                        );
+                        if expected == CheckStatus::Fail {
+                            assert!(log.details.as_ref().unwrap().iter().any(|detail| {
+                                detail.error_code == "OUTPUT_LOCK_HASH_TYPE_INVALID"
+                                    && detail.tx_index == Some(0)
+                                    && detail.output_index == Some(0)
+                                    && detail.actual_value == Some(format!("0x{hash_type:02x}"))
+                            }));
+                        }
+                        if is_cellbase {
+                            auditor.check_cellbase_structure(&block_json, &mut log);
+                            assert_eq!(
+                                log.check_cellbase_structure,
+                                if height == 0 {
+                                    CheckStatus::NotApplicable
+                                } else {
+                                    expected
+                                }
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cellbase_versions_and_dependencies_without_input_or_capacity_checks() {
+        let cfg = test_config(PathBuf::from("cursor.json"));
+        let auditor = Auditor::new(Arc::new(MockRpc::default()), cfg.clone());
+        let consensus = ConsensusSnapshot::from_rpc(&cfg, mock_consensus()).unwrap();
+        let cell_dep = packed::CellDep::new_builder()
+            .out_point(PackedOutPoint::new(Byte32::new([1; 32]), 0))
+            .build();
+        for height in [0, 1] {
+            for (version, duplicate_cell_dep, duplicate_header_dep) in [
+                (0u32, false, false),
+                (1, false, false),
+                (0, true, false),
+                (0, false, true),
+            ] {
+                let mut builder = empty_cellbase(height)
+                    .as_advanced_builder()
+                    .version(version);
+                if duplicate_cell_dep {
+                    builder = builder
+                        .cell_dep(cell_dep.clone())
+                        .cell_dep(cell_dep.clone());
+                }
+                if duplicate_header_dep {
+                    builder = builder
+                        .header_dep(Byte32::new([2; 32]))
+                        .header_dep(Byte32::new([2; 32]));
+                }
+                let block = BlockBuilder::default()
+                    .header(
+                        HeaderBuilder::default()
+                            .number(height)
+                            .epoch(EpochNumberWithFraction::new(0, height, 1000).full_value())
+                            .build(),
+                    )
+                    .transaction(builder.build())
+                    .build();
+                let block_json: BlockView = block.clone().into();
+                let mut log = AuditLog::new(&cfg, &block_json);
+                auditor
+                    .audit_transactions(&block_json, &block, &mut log, Some(&consensus))
+                    .await;
+                for (actual, invalid) in [
+                    (log.check_transaction_version, version != 0),
+                    (log.check_duplicate_cell_deps, duplicate_cell_dep),
+                    (log.check_duplicate_header_deps, duplicate_header_dep),
+                ] {
+                    assert_eq!(
+                        actual,
+                        if invalid {
+                            CheckStatus::Fail
+                        } else {
+                            CheckStatus::Pass
+                        }
+                    );
+                }
+                for status in [
+                    log.check_inputs_outputs_structure,
+                    log.check_outputs_data_length,
+                    log.check_output_lock_hash_type,
+                    log.check_duplicate_inputs_in_transaction,
+                    log.check_duplicate_inputs_in_block,
+                    log.check_input_content_resolution,
+                    log.check_input_output_index,
+                    log.check_occupied_capacity,
+                    log.check_ordinary_capacity_conservation,
+                    log.check_dao_withdraw_capacity,
+                ] {
+                    assert_eq!(status, CheckStatus::NotApplicable);
+                }
+                assert!(
+                    log.details
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .all(|detail| detail.tx_index == Some(0))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_arbitrary_block_versions_stay_not_applicable_without_consensus() {
+        let cfg = test_config(PathBuf::from("cursor.json"));
+        let auditor = Auditor::new(Arc::new(MockRpc::default()), cfg.clone());
+        let consensus = ConsensusSnapshot::from_rpc(&cfg, mock_consensus()).unwrap();
+        for version in [0, 1, u32::MAX] {
+            let block: BlockView = BlockBuilder::default()
+                .header(
+                    HeaderBuilder::default()
+                        .number(1u64)
+                        .epoch(EpochNumberWithFraction::new(0, 1, 1000).full_value())
+                        .version(version)
+                        .build(),
+                )
+                .transaction(empty_cellbase(1))
+                .build()
+                .into();
+            let missing_consensus_log = auditor
+                .audit_block_without_consensus_once(&block, &anyhow!("unavailable"))
+                .await;
+            let available_consensus_log = auditor
+                .audit_block_with_consensus_once(&block, &consensus)
+                .await;
+            for mut log in [missing_consensus_log, available_consensus_log] {
+                for attempt in [1, 2] {
+                    log.finalize(attempt, 1);
+                    assert_eq!(log.check_block_version, CheckStatus::NotApplicable);
+                    assert!(
+                        log.details
+                            .as_deref()
+                            .unwrap_or_default()
+                            .iter()
+                            .all(|detail| detail.check_name != "check_block_version")
+                    );
+                    let value = serde_json::to_value(&log).unwrap();
+                    assert!(value.get("check_block_version").is_none());
+                    assert!(!value["failed_checks"].as_array().is_some_and(|checks| {
+                        checks.iter().any(|check| check == "check_block_version")
+                    }));
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -8329,7 +8585,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_block_version_and_uncle_limit_boundaries() {
+    async fn test_block_version_is_not_checked_and_uncle_limit_boundaries() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(dir.path().join("cursor.json"));
         let block = BlockBuilder::default()
@@ -8359,38 +8615,38 @@ mod tests {
                 Some(&pass_consensus),
             )
             .await;
-        assert_eq!(pass_log.check_block_version, CheckStatus::Pass);
+        assert_eq!(pass_log.check_block_version, CheckStatus::NotApplicable);
         assert_eq!(pass_log.check_uncle_count_limit, CheckStatus::Pass);
 
-        let mut block_version_fail_value =
+        let mut different_version_value =
             serde_json::to_value(mock_consensus_with_limit(10_000_000)).unwrap();
-        block_version_fail_value["max_uncles_num"] = json!("0x0");
-        block_version_fail_value["block_version"] = json!("0x1");
-        let block_version_fail_consensus = ConsensusSnapshot::from_rpc(
+        different_version_value["max_uncles_num"] = json!("0x0");
+        different_version_value["block_version"] = json!("0x1");
+        let different_version_consensus = ConsensusSnapshot::from_rpc(
             &cfg,
-            serde_json::from_value(block_version_fail_value).unwrap(),
+            serde_json::from_value(different_version_value).unwrap(),
         )
         .unwrap();
-        let mut block_version_fail_log = AuditLog::new(&cfg, &block_json);
+        let mut different_version_log = AuditLog::new(&cfg, &block_json);
         auditor
             .audit_header_and_block(
                 &block_json,
                 &core_block,
-                &mut block_version_fail_log,
-                Some(&block_version_fail_consensus),
+                &mut different_version_log,
+                Some(&different_version_consensus),
             )
             .await;
         assert_eq!(
-            block_version_fail_log.check_block_version,
-            CheckStatus::Fail
+            different_version_log.check_block_version,
+            CheckStatus::NotApplicable
         );
         assert!(
-            block_version_fail_log
+            different_version_log
                 .details
-                .as_ref()
-                .unwrap()
+                .as_deref()
+                .unwrap_or_default()
                 .iter()
-                .any(|detail| detail.error_code == "BLOCK_VERSION_MISMATCH")
+                .all(|detail| detail.check_name != "check_block_version")
         );
 
         let uncle_source = BlockBuilder::default()
