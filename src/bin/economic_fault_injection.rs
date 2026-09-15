@@ -88,6 +88,11 @@ async fn main() -> Result<()> {
         .build();
     let malicious_hash: H256 = malicious_tx.hash().unpack();
 
+    // Height 1 on the dev chain has a genesis->first-epoch transition that is not
+    // relevant to this capacity test. Generate one fully verified block first so
+    // the injected block at height 2 isolates the intended economic fault.
+    let _: H256 = rpc(&client, &rpc_url, "generate_block", json!([])).await?;
+
     // Start from a node-generated next-block template so parent/epoch/timestamp,
     // cellbase, extension, proposals and uncle data remain realistic. Replace the
     // transaction list with exactly one deliberately inflationary transaction.
