@@ -14,29 +14,29 @@ on:
         type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ inputs.tag }}
   cancel-in-progress: false
 
 jobs:
-  release:
-    name: Build and publish Linux binary
+  authorize:
+    name: Verify release authorization
     runs-on: ubuntu-24.04
     steps:
-      - name: Verify admin and default branch
+      - name: Require admin and default branch
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
           REPO: ${{ github.repository }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
 
-          permission="$(gh api "repos/${REPO}/collaborators/${ACTOR}/permission" --jq '.permission')"
-          echo "Triggered by ${ACTOR}; repository permission: ${permission}"
+          permission="$(gh api "repos/${REPO}/collaborators/${TRIGGERING_ACTOR}/permission" --jq '.permission')"
+          echo "Triggered by ${TRIGGERING_ACTOR}; repository permission: ${permission}"
 
           if [[ "${permission}" != "admin" ]]; then
             echo "::error::Only repository admins may publish releases."
@@ -48,6 +48,13 @@ jobs:
             exit 1
           fi
 
+  release:
+    name: Build and publish Linux binary
+    needs: authorize
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
