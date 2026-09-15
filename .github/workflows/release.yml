@@ -1,0 +1,149 @@
+name: Release binary
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag; must match Cargo.toml version (for example v0.2.0)"
+        required: true
+        type: string
+      prerelease:
+        description: "Publish as a prerelease"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish Linux binary
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify admin and default branch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          permission="$(gh api "repos/${REPO}/collaborators/${ACTOR}/permission" --jq '.permission')"
+          echo "Triggered by ${ACTOR}; repository permission: ${permission}"
+
+          if [[ "${permission}" != "admin" ]]; then
+            echo "::error::Only repository admins may publish releases."
+            exit 1
+          fi
+
+          if [[ "${GITHUB_REF_NAME}" != "${DEFAULT_BRANCH}" ]]; then
+            echo "::error::Releases must be dispatched from the default branch (${DEFAULT_BRANCH}), not ${GITHUB_REF_NAME}."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate release tag
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          expected_tag="v${version}"
+
+          if [[ "${TAG}" != "${expected_tag}" ]]; then
+            echo "::error::Release tag ${TAG} does not match Cargo.toml version ${version}; expected ${expected_tag}."
+            exit 1
+          fi
+
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::Git tag ${TAG} already exists."
+            exit 1
+          fi
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "::error::GitHub Release ${TAG} already exists."
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build \
+            --release \
+            --locked \
+            --target x86_64-unknown-linux-musl \
+            --bin ckb-block-auditor
+
+          target/x86_64-unknown-linux-musl/release/ckb-block-auditor --version
+          file target/x86_64-unknown-linux-musl/release/ckb-block-auditor
+
+      - name: Package binary and checksum
+        id: package
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          archive="ckb-block-auditor-${TAG}-x86_64-unknown-linux-musl.tar.gz"
+          mkdir -p dist/package
+          cp target/x86_64-unknown-linux-musl/release/ckb-block-auditor dist/package/
+          tar -C dist/package -czf "dist/${archive}" ckb-block-auditor
+          sha256sum "dist/${archive}" > "dist/${archive}.sha256"
+
+          echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
+          ls -lh dist/
+          cat "dist/${archive}.sha256"
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          set -euo pipefail
+
+          args=(
+            release create "${TAG}"
+            "dist/${ARCHIVE}"
+            "dist/${ARCHIVE}.sha256"
+            --repo "${GITHUB_REPOSITORY}"
+            --target "${GITHUB_SHA}"
+            --title "${TAG}"
+            --generate-notes
+          )
+
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            args+=(--prerelease)
+          fi
+
+          gh "${args[@]}"
