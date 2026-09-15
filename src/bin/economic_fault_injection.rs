@@ -49,8 +49,9 @@ async fn main() -> Result<()> {
     let client = Client::new();
 
     // Use a committed, non-DAO genesis output as the malicious transaction input.
-    // The block itself is later inserted with process_block_without_verify, so no
-    // lock witness is required for this fault-injection scenario.
+    // This keeps the E2E independent from wallet/key management and from cellbase
+    // maturity. The block itself is later inserted with process_block_without_verify,
+    // so no lock witness/signature is required for this fault-injection scenario.
     let genesis: Option<BlockView> = rpc(
         &client,
         &rpc_url,
@@ -88,14 +89,11 @@ async fn main() -> Result<()> {
         .build();
     let malicious_hash: H256 = malicious_tx.hash().unpack();
 
-    // Height 1 on the dev chain has a genesis->first-epoch transition that is not
-    // relevant to this capacity test. Generate one fully verified block first so
-    // the injected block at height 2 isolates the intended economic fault.
-    let _: H256 = rpc(&client, &rpc_url, "generate_block", json!([])).await?;
-
-    // Start from a node-generated next-block template so parent/epoch/timestamp,
-    // cellbase, extension, proposals and uncle data remain realistic. Replace the
-    // transaction list with exactly one deliberately inflationary transaction.
+    // CI mines ten normal dev-chain blocks with the built-in miner before running
+    // this injector. Start from the node-generated next-block template so
+    // parent/epoch/timestamp, cellbase, extension, proposals and uncle data remain
+    // realistic. Replace the transaction list with exactly one deliberately
+    // inflationary transaction.
     let mut template: BlockTemplate =
         rpc(&client, &rpc_url, "get_block_template", json!([])).await?;
     template.transactions.clear();
