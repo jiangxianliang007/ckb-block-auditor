@@ -50,6 +50,8 @@ struct Args {
     block_cache_max_bytes: usize,
     #[arg(long, env = "CKB_STATS_INTERVAL_SECS", default_value_t = 60)]
     stats_interval_secs: u64,
+    #[arg(long, env = "CKB_ENABLE_POW_CHECK", default_value_t = true)]
+    enable_pow_check: bool,
 }
 
 #[tokio::main]
@@ -74,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
         block_cache_entries: args.block_cache_entries,
         block_cache_max_bytes: args.block_cache_max_bytes,
         stats_interval_secs: args.stats_interval_secs,
+        enable_pow_check: args.enable_pow_check,
     };
 
     let rpc = Arc::new(HttpRpc::new_with_pacing(
