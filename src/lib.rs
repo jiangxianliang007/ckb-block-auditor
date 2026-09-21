@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
@@ -40,6 +40,8 @@ const RATE_RECOVERY_SUCCESS_WINDOW: u64 = 20;
 const PENDING_LOG_REMINDER_ROUNDS: u32 = 10;
 const PENDING_EXECUTION_BACKOFF_FLOOR_SECS: u64 = 15;
 const PENDING_EXECUTION_BACKOFF_CAP_SECS: u64 = 300;
+const LOG_TAIL_CHUNK_BYTES: usize = 8192;
+const LOG_TAIL_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 fn is_enabled_script_hash_type(hash_type: u8) -> bool {
     matches!(hash_type, 0 | 1 | 2 | 4)
@@ -162,6 +164,8 @@ impl CursorState {
         self.last_hash = hash.clone();
         self.next_height = None;
         self.next_hash = None;
+        self.history
+            .retain(|saved_height, _| *saved_height <= height);
         self.history.insert(height, hash);
         while self.history.len() > retention {
             if let Some(key) = self.history.keys().next().copied() {
@@ -177,6 +181,8 @@ impl CursorState {
         if height > 0 {
             self.last_height = height - 1;
             self.last_hash = format!("{:#x}", block.header.inner.parent_hash);
+            self.history
+                .retain(|saved_height, _| *saved_height < height);
             self.history
                 .insert(self.last_height, self.last_hash.clone());
             while self.history.len() > retention {
@@ -231,12 +237,19 @@ impl EmittedAuditWindow {
         let Some(path) = path else {
             return window;
         };
-        let Ok(content) = std::fs::read_to_string(path) else {
+        let Ok(mut file) = std::fs::File::open(path) else {
             return window;
         };
-        let recent_lines: Vec<_> = content.lines().rev().take(window.limit).collect();
+        let Ok(content) = read_log_tail(&mut file, window.limit) else {
+            return window;
+        };
+        let content = content.strip_suffix(b"\n").unwrap_or(&content);
+        let recent_lines: Vec<_> = content
+            .rsplit(|byte| *byte == b'\n')
+            .take(window.limit)
+            .collect();
         for line in recent_lines.into_iter().rev() {
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
                 continue;
             };
             let Some(block_hash) = value.get("block_hash").and_then(|item| item.as_str()) else {
@@ -270,6 +283,39 @@ impl EmittedAuditWindow {
             self.keys.pop_front();
         }
     }
+}
+
+// Read backwards only far enough to recover the requested physical lines. The
+// byte cap also bounds startup work for corrupt logs with very long/no lines.
+// If the cap cuts a record in half, discard that record; deduplication is best effort.
+fn read_log_tail(reader: &mut (impl Read + Seek), lines: usize) -> std::io::Result<Vec<u8>> {
+    let mut position = reader.seek(SeekFrom::End(0))?;
+    let mut chunks = Vec::new();
+    let mut bytes = 0;
+    let mut newlines = 0;
+    while position > 0 && newlines <= lines && bytes < LOG_TAIL_MAX_BYTES {
+        let size = position.min(LOG_TAIL_CHUNK_BYTES as u64) as usize;
+        let size = size.min(LOG_TAIL_MAX_BYTES - bytes);
+        position -= size as u64;
+        reader.seek(SeekFrom::Start(position))?;
+        let mut chunk = vec![0; size];
+        reader.read_exact(&mut chunk)?;
+        newlines += chunk.iter().filter(|byte| **byte == b'\n').count();
+        bytes += size;
+        chunks.push(chunk);
+    }
+    let mut content = Vec::with_capacity(bytes);
+    for chunk in chunks.into_iter().rev() {
+        content.extend_from_slice(&chunk);
+    }
+    if position > 0 {
+        if let Some(first_newline) = content.iter().position(|byte| *byte == b'\n') {
+            content.drain(..=first_newline);
+        } else {
+            content.clear();
+        }
+    }
+    Ok(content)
 }
 
 #[derive(Debug, Default)]
@@ -687,6 +733,8 @@ pub struct AuditLog {
     pub canonical_at_audit: bool,
 
     pub result: AuditResult,
+    #[serde(default)]
+    pub audit_complete: bool,
     pub audit_duration_ms: u64,
 
     #[serde(skip_serializing_if = "CheckStatus::is_omitted")]
@@ -772,7 +820,7 @@ impl AuditLog {
     fn new(config: &AuditorConfig, block: &BlockView) -> Self {
         Self {
             timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-            schema_version: 4,
+            schema_version: 5,
             service: "ckb-block-auditor".to_string(),
             auditor_version: env!("CARGO_PKG_VERSION").to_string(),
             node_id: config.node_id.clone(),
@@ -782,6 +830,7 @@ impl AuditLog {
             block_timestamp: block.header.inner.timestamp.value(),
             canonical_at_audit: true,
             result: AuditResult::Fail,
+            audit_complete: false,
             audit_duration_ms: 0,
 
             check_block_height: CheckStatus::Unknown,
@@ -838,90 +887,20 @@ impl AuditLog {
         }
     }
 
-    fn finalize(&mut self, attempts: u32, max_retries: u32) {
-        let checks = vec![
-            ("check_block_height", self.check_block_height),
-            ("check_parent_hash", self.check_parent_hash),
-            ("check_epoch_continuity", self.check_epoch_continuity),
-            ("check_timestamp", self.check_timestamp),
-            ("check_block_version", self.check_block_version),
-            ("check_block_size", self.check_block_size),
-            ("check_uncle_count_limit", self.check_uncle_count_limit),
-            ("check_uncle_hashes", self.check_uncle_hashes),
-            ("check_proposal_limit", self.check_proposal_limit),
-            ("check_pow", self.check_pow),
-            ("check_block_hash", self.check_block_hash),
-            ("check_transaction_hashes", self.check_transaction_hashes),
-            ("check_transactions_root", self.check_transactions_root),
-            ("check_proposals_hash", self.check_proposals_hash),
-            ("check_extra_hash", self.check_extra_hash),
-            (
-                "check_duplicate_transactions",
-                self.check_duplicate_transactions,
-            ),
-            ("check_duplicate_proposals", self.check_duplicate_proposals),
-            ("check_cellbase_structure", self.check_cellbase_structure),
-            ("check_transaction_version", self.check_transaction_version),
-            (
-                "check_inputs_outputs_structure",
-                self.check_inputs_outputs_structure,
-            ),
-            ("check_outputs_data_length", self.check_outputs_data_length),
-            (
-                "check_output_lock_hash_type",
-                self.check_output_lock_hash_type,
-            ),
-            ("check_duplicate_cell_deps", self.check_duplicate_cell_deps),
-            (
-                "check_duplicate_header_deps",
-                self.check_duplicate_header_deps,
-            ),
-            (
-                "check_duplicate_inputs_in_transaction",
-                self.check_duplicate_inputs_in_transaction,
-            ),
-            (
-                "check_duplicate_inputs_in_block",
-                self.check_duplicate_inputs_in_block,
-            ),
-            (
-                "check_input_content_resolution",
-                self.check_input_content_resolution,
-            ),
-            ("check_input_output_index", self.check_input_output_index),
-            ("check_occupied_capacity", self.check_occupied_capacity),
-            (
-                "check_ordinary_capacity_conservation",
-                self.check_ordinary_capacity_conservation,
-            ),
-            (
-                "check_cellbase_reward_amount",
-                self.check_cellbase_reward_amount,
-            ),
-            (
-                "check_cellbase_reward_target",
-                self.check_cellbase_reward_target,
-            ),
-            (
-                "check_dao_withdraw_capacity",
-                self.check_dao_withdraw_capacity,
-            ),
-        ];
-
-        let mut failed_checks: Vec<String> = checks
+    // Returns false when there is neither a conclusive failure nor a complete
+    // success. UNKNOWN is evidence of incomplete auditing, not an invalid block.
+    fn finalize(&mut self, attempts: u32, max_retries: u32) -> bool {
+        let checks = self.check_statuses();
+        self.audit_complete = !self.has_unresolved_checks();
+        let failed_checks: Vec<String> = checks
             .iter()
             .filter_map(|(name, status)| {
                 (*status == CheckStatus::Fail).then_some((*name).to_string())
             })
             .collect();
-        let unresolved_checks: Vec<String> = checks
-            .iter()
-            .filter_map(|(name, status)| {
-                (*status == CheckStatus::Unknown).then_some((*name).to_string())
-            })
-            .collect();
-
-        failed_checks.extend(unresolved_checks.iter().cloned());
+        if failed_checks.is_empty() && !self.audit_complete {
+            return false;
+        }
         self.failed_checks = (!failed_checks.is_empty()).then_some(failed_checks);
         if self.details_total.unwrap_or(0) > 0 {
             self.details_truncated.get_or_insert(false);
@@ -931,23 +910,16 @@ impl AuditLog {
             self.details_total = None;
             self.details_truncated = None;
         }
-
         if let Some(details) = self.details.as_mut() {
             for detail in details {
                 match detail.status {
                     CheckStatus::Fail => {
-                        detail
-                            .failure_kind
-                            .get_or_insert(FailureKind::ValidationFailed);
+                        detail.failure_kind = Some(FailureKind::ValidationFailed);
                     }
                     CheckStatus::Unknown => {
-                        detail.status = CheckStatus::Fail;
-                        detail.failure_kind =
-                            Some(if is_retryable_execution_error(&detail.error_code) {
-                                FailureKind::RetryExhausted
-                            } else {
-                                FailureKind::ExecutionFailed
-                            });
+                        // A different check already failed. Do not label this
+                        // unresolved prerequisite as a validation/retry failure.
+                        detail.failure_kind = None;
                         if detail.rpc_method.is_none() {
                             detail.rpc_method =
                                 rpc_method_for_error_code(&detail.error_code).map(str::to_string);
@@ -959,13 +931,12 @@ impl AuditLog {
                 }
             }
         }
-
-        self.map_unknown_checks_to_fail();
         self.result = if self.failed_checks.is_some() {
             AuditResult::Fail
         } else {
             AuditResult::Pass
         };
+        true
     }
 
     fn has_detail_for(&self, check_name: &str) -> bool {
@@ -1058,47 +1029,6 @@ impl AuditLog {
                 self.check_dao_withdraw_capacity,
             ),
         ]
-    }
-
-    fn map_unknown_checks_to_fail(&mut self) {
-        for status in [
-            &mut self.check_block_height,
-            &mut self.check_parent_hash,
-            &mut self.check_epoch_continuity,
-            &mut self.check_timestamp,
-            &mut self.check_block_size,
-            &mut self.check_uncle_count_limit,
-            &mut self.check_uncle_hashes,
-            &mut self.check_proposal_limit,
-            &mut self.check_pow,
-            &mut self.check_block_hash,
-            &mut self.check_transaction_hashes,
-            &mut self.check_transactions_root,
-            &mut self.check_proposals_hash,
-            &mut self.check_extra_hash,
-            &mut self.check_duplicate_transactions,
-            &mut self.check_duplicate_proposals,
-            &mut self.check_cellbase_structure,
-            &mut self.check_transaction_version,
-            &mut self.check_inputs_outputs_structure,
-            &mut self.check_outputs_data_length,
-            &mut self.check_output_lock_hash_type,
-            &mut self.check_duplicate_cell_deps,
-            &mut self.check_duplicate_header_deps,
-            &mut self.check_duplicate_inputs_in_transaction,
-            &mut self.check_duplicate_inputs_in_block,
-            &mut self.check_input_content_resolution,
-            &mut self.check_input_output_index,
-            &mut self.check_occupied_capacity,
-            &mut self.check_ordinary_capacity_conservation,
-            &mut self.check_cellbase_reward_amount,
-            &mut self.check_cellbase_reward_target,
-            &mut self.check_dao_withdraw_capacity,
-        ] {
-            if *status == CheckStatus::Unknown {
-                *status = CheckStatus::Fail;
-            }
-        }
     }
 }
 
@@ -2125,11 +2055,16 @@ impl<R: CkbRpc> Auditor<R> {
             self.save_cursor(state).await?;
         }
 
-        let start_height = if let Some(state) = cursor.as_ref() {
+        let start_height = if let Some(state) = cursor.as_mut() {
             let completed_start = if state.last_hash.is_empty() && state.history.is_empty() {
                 state.next_height.unwrap_or(tip_height)
             } else {
-                self.resolve_common_ancestor(state).await? + 1
+                let previous = (state.last_height, state.last_hash.clone());
+                let ancestor = self.resolve_common_ancestor(state).await?;
+                if previous != (state.last_height, state.last_hash.clone()) {
+                    self.save_cursor(state).await?;
+                }
+                ancestor + 1
             };
             state
                 .next_height
@@ -2184,6 +2119,19 @@ impl<R: CkbRpc> Auditor<R> {
                     non_retryable_execution,
                 ),
             };
+            // A batch is not an atomic chain snapshot. If a reorg occurred
+            // after the previous block was emitted, do not advance over its
+            // replacement. The next poll will rewind to the common ancestor.
+            if let Some(state) = cursor.as_ref()
+                && !state.last_hash.is_empty()
+                && height == state.last_height.saturating_add(1)
+                && format!("{:#x}", block.header.inner.parent_hash) != state.last_hash
+            {
+                eprintln!(
+                    "canonical chain changed during audit batch at height {height}; retrying from common ancestor"
+                );
+                break;
+            }
             let hash = format!("{:#x}", block.header.hash);
             if pending_hash
                 .as_deref()
@@ -2210,12 +2158,16 @@ impl<R: CkbRpc> Auditor<R> {
                     state.push_block(height, hash, self.config.history_retention);
                     self.save_cursor(state).await?;
                 } else {
-                    let state = CursorState::new(
+                    // Keep the tip's parent as a rewind anchor as well. Without
+                    // it, a one-block reorg just after startup would already
+                    // look like a reorg beyond the retained history.
+                    let mut state = CursorState::new(
                         format!("{:#x}", consensus.genesis_hash),
-                        height,
-                        hash,
+                        height.saturating_sub(1),
+                        format!("{:#x}", block.header.inner.parent_hash),
                         self.config.history_retention,
                     );
+                    state.push_block(height, hash, self.config.history_retention);
                     self.save_cursor(&state).await?;
                     *cursor = Some(state);
                     eprintln!("initialized cursor at audited tip height {}", height);
@@ -2249,7 +2201,7 @@ impl<R: CkbRpc> Auditor<R> {
         Ok(())
     }
 
-    async fn resolve_common_ancestor(&self, state: &CursorState) -> Result<u64> {
+    async fn resolve_common_ancestor(&self, state: &mut CursorState) -> Result<u64> {
         if state.last_hash.is_empty() {
             return Ok(state
                 .next_height
@@ -2285,7 +2237,10 @@ impl<R: CkbRpc> Auditor<R> {
             let Some(header) = self.rpc.get_header_by_number(height).await? else {
                 continue;
             };
-            if format!("{:#x}", header.hash) == *local_hash {
+            let hash = format!("{:#x}", header.hash);
+            if hash == *local_hash {
+                // Rewind before replay: remove orphaned history and pending work.
+                state.push_block(height, hash, self.config.history_retention);
                 return Ok(height);
             }
         }
@@ -2302,12 +2257,26 @@ impl<R: CkbRpc> Auditor<R> {
                 "action": "anchor_to_tip_minus_one",
             })
         );
-        Ok(self
+        let tip = self
             .rpc
             .get_tip_header()
             .await?
-            .map(|h| h.inner.number.value().saturating_sub(1))
-            .unwrap_or(state.last_height))
+            .ok_or_else(|| anyhow!("tip header missing while recovering deep reorg"))?;
+        let height = tip.inner.number.value().saturating_sub(1);
+        let anchor = self
+            .rpc
+            .get_header_by_number(height)
+            .await?
+            .ok_or_else(|| anyhow!("reorg anchor missing at height {height}"))?;
+        // Preserve the existing deep-reorg policy, but replace the hash even
+        // when the new anchor happens to have the same height as the old cursor.
+        state.history.clear();
+        state.push_block(
+            height,
+            format!("{:#x}", anchor.hash),
+            self.config.history_retention,
+        );
+        Ok(height)
     }
 
     async fn consensus(&self) -> Result<ConsensusSnapshot> {
@@ -2336,10 +2305,8 @@ impl<R: CkbRpc> Auditor<R> {
             let mut log = self
                 .audit_block_with_consensus_once(&block, consensus)
                 .await;
-            let unresolved = log.has_unresolved_checks();
             let non_retryable = log.has_non_retryable_execution_failure();
-            if !unresolved {
-                log.finalize(attempt, self.config.max_retries);
+            if log.finalize(attempt, self.config.max_retries) {
                 return Ok(Some(HeightAuditOutcome::Finalized { block, log }));
             }
             if self.rpc.has_rate_limit_cooldown() {
@@ -5284,43 +5251,6 @@ fn retry_backoff(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(RETRY_BASE_DELAY_MS.saturating_mul(factor))
 }
 
-fn is_retryable_execution_error(error_code: &str) -> bool {
-    matches!(
-        error_code,
-        "PARENT_HEADER_MISSING"
-            | "PARENT_HEADER_UNAVAILABLE"
-            | "TIMESTAMP_ANCESTOR_UNAVAILABLE"
-            | "TIMESTAMP_MEDIAN_INCOMPLETE"
-            | "INPUT_TX_NOT_COMMITTED"
-            | "INPUT_TX_BLOCK_HASH_MISSING"
-            | "INPUT_TX_JSON_MISSING"
-            | "INPUT_TX_MISSING"
-            | "INPUT_TX_RPC_ERROR"
-            | "INPUT_TX_BLOCK_NUMBER_MISSING"
-            | "INPUT_INDEX_UNVERIFIED"
-            | "INPUT_SOURCE_BLOCK_HASH_ZERO"
-            | "ORDINARY_CAPACITY_CLASSIFICATION_UNKNOWN"
-            | "ORDINARY_CAPACITY_INCOMPLETE"
-            | "DAO_WITHDRAW_CAPACITY_INCOMPLETE"
-            | "DAO_CLASSIFICATION_UNKNOWN"
-            | "DAO_DEPOSIT_HEADER_MISSING"
-            | "DAO_DEPOSIT_HEADER_RPC_ERROR"
-            | "REWARD_TARGET_HEADER_MISSING"
-            | "REWARD_TARGET_HEADER_RPC_ERROR"
-            | "REWARD_FINALIZATION_MISMATCH"
-            | "REWARD_TARGET_BLOCK_MISMATCH"
-            | "REWARD_TARGET_BLOCK_MISSING"
-            | "REWARD_TARGET_BLOCK_RPC_ERROR"
-            | "REWARD_TARGET_CELLBASE_MISSING"
-            | "REWARD_TARGET_WITNESS_INVALID"
-            | "ECONOMIC_STATE_MISSING"
-            | "ECONOMIC_STATE_RPC_ERROR"
-            | "DAO_MAXIMUM_WITHDRAW_MISSING"
-            | "DAO_MAXIMUM_WITHDRAW_RPC_ERROR"
-            | "CONSENSUS_UNAVAILABLE"
-    )
-}
-
 fn is_block_retryable_execution_error(error_code: &str) -> bool {
     matches!(
         error_code,
@@ -5446,6 +5376,7 @@ mod tests {
         dao_calls: Mutex<Vec<(String, String)>>,
         consensus: Mutex<Option<RpcConsensus>>,
         method_calls: Mutex<HashMap<String, u64>>,
+        reorg_on_block: Mutex<Option<(u64, Vec<BlockView>)>>,
     }
 
     impl MockRpc {
@@ -5463,6 +5394,266 @@ mod tests {
                 .copied()
                 .unwrap_or(0)
         }
+
+        fn insert_block(&self, block: &BlockView) {
+            self.headers_by_number
+                .lock()
+                .unwrap()
+                .insert(block.header.inner.number.value(), block.header.clone());
+            self.headers_by_hash
+                .lock()
+                .unwrap()
+                .insert(format!("{:#x}", block.header.hash), block.header.clone());
+            self.blocks_by_number
+                .lock()
+                .unwrap()
+                .insert(block.header.inner.number.value(), block.clone());
+        }
+    }
+
+    fn audit_test_block(
+        parent: Option<&BlockView>,
+        height: u64,
+        nonce: u128,
+        cellbase: bool,
+    ) -> BlockView {
+        let header = HeaderBuilder::default()
+            .number(height)
+            .timestamp(1000 + height * 100)
+            .epoch(EpochNumberWithFraction::new(0, height, 1000).full_value())
+            .parent_hash(
+                parent
+                    .map(|block| block.header.hash.pack())
+                    .unwrap_or_default(),
+            )
+            .nonce(nonce)
+            .build();
+        let block = BlockBuilder::default().header(header);
+        if cellbase {
+            block.transaction(empty_cellbase(height)).build().into()
+        } else {
+            block.build().into()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_missing_cellbase_emits_incomplete_fail_and_continues_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().join("cursor.json"));
+        cfg.log_path = Some(dir.path().join("audit.log"));
+        let genesis = audit_test_block(None, 0, 0, true);
+        let bad = audit_test_block(Some(&genesis), 1, 0, false);
+        let next = audit_test_block(Some(&bad), 2, 0, true);
+        let rpc = Arc::new(MockRpc::default());
+        *rpc.consensus.lock().unwrap() = Some(mock_consensus());
+        *rpc.tip.lock().unwrap() = Some(bad.header.clone());
+        for block in [&genesis, &bad, &next] {
+            rpc.insert_block(block);
+        }
+        let auditor = Auditor::new(rpc.clone(), cfg.clone());
+        let mut cursor = None;
+        auditor.poll_once(&mut cursor).await.unwrap();
+        let logs = read_log_lines(cfg.log_path.as_ref().unwrap());
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0]["result"], "FAIL");
+        assert_eq!(logs[0]["audit_complete"], false);
+        assert_eq!(logs[0]["check_cellbase_reward_target"], "UNKNOWN");
+        assert_eq!(cursor.as_ref().unwrap().last_height, 1);
+        assert!(cursor.as_ref().unwrap().next_height.is_none());
+
+        *rpc.tip.lock().unwrap() = Some(next.header.clone());
+        let restarted = Auditor::new(rpc, cfg.clone());
+        let mut cursor = restarted.load_cursor().await.unwrap();
+        restarted.poll_once(&mut cursor).await.unwrap();
+        let logs = read_log_lines(cfg.log_path.as_ref().unwrap());
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[1]["block_height"], 2);
+        assert_eq!(logs[1]["result"], "PASS");
+        assert_eq!(logs[1]["audit_complete"], true);
+    }
+
+    #[tokio::test]
+    async fn test_reorg_during_batch_replays_replacement_before_advancing() {
+        for (persistent, start_at_tip) in [(false, false), (true, false), (true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = test_config(dir.path().join("cursor.json"));
+            if !persistent {
+                cfg.cursor_path = None;
+            }
+            cfg.log_path = Some(dir.path().join("audit.log"));
+            let genesis = audit_test_block(None, 0, 0, true);
+            let old_one = audit_test_block(Some(&genesis), 1, 0, true);
+            let old_two = audit_test_block(Some(&old_one), 2, 0, true);
+            let new_one = audit_test_block(Some(&genesis), 1, 1, true);
+            let new_two = audit_test_block(Some(&new_one), 2, 1, true);
+            let rpc = Arc::new(MockRpc::default());
+            *rpc.consensus.lock().unwrap() = Some(mock_consensus());
+            *rpc.tip.lock().unwrap() = Some(if start_at_tip {
+                old_one.header.clone()
+            } else {
+                genesis.header.clone()
+            });
+            for block in [&genesis, &old_one, &old_two] {
+                rpc.insert_block(block);
+            }
+            let auditor = Auditor::new(rpc.clone(), cfg.clone());
+            let mut cursor = None;
+            auditor.poll_once(&mut cursor).await.unwrap();
+
+            *rpc.tip.lock().unwrap() = Some(old_two.header.clone());
+            *rpc.reorg_on_block.lock().unwrap() = Some((2, vec![new_one.clone(), new_two.clone()]));
+            auditor.poll_once(&mut cursor).await.unwrap();
+            assert_eq!(cursor.as_ref().unwrap().last_height, 1);
+            let logs = read_log_lines(cfg.log_path.as_ref().unwrap());
+            let previous_logs = if start_at_tip { 1 } else { 2 };
+            assert_eq!(
+                logs.len(),
+                previous_logs,
+                "must not emit new height 2 before replacement height 1"
+            );
+
+            *rpc.tip.lock().unwrap() = Some(new_two.header.clone());
+            let restarted;
+            let active = if persistent {
+                restarted = Auditor::new(rpc.clone(), cfg.clone());
+                cursor = restarted.load_cursor().await.unwrap();
+                &restarted
+            } else {
+                &auditor
+            };
+            active.poll_once(&mut cursor).await.unwrap();
+            active.poll_once(&mut cursor).await.unwrap();
+            let logs = read_log_lines(cfg.log_path.as_ref().unwrap());
+            assert_eq!(logs.len(), previous_logs + 2);
+            assert!(logs.iter().all(|log| log["result"] == "PASS"));
+            assert_eq!(
+                logs[previous_logs]["block_hash"],
+                format!("{:#x}", new_one.header.hash)
+            );
+            assert_eq!(
+                logs[previous_logs + 1]["block_hash"],
+                format!("{:#x}", new_two.header.hash)
+            );
+            let state = cursor.unwrap();
+            assert_eq!(state.last_height, 2);
+            assert_eq!(state.history[&1], format!("{:#x}", new_one.header.hash));
+            assert!(state.next_height.is_none());
+        }
+    }
+
+    #[test]
+    fn test_rewind_discards_future_history_and_pending_progress() {
+        let mut cursor = CursorState::new("genesis".into(), 0, "zero".into(), 32);
+        for height in 1..=4 {
+            cursor.push_block(height, format!("old-{height}"), 32);
+        }
+        cursor.next_height = Some(5);
+        cursor.next_hash = Some("old-5".into());
+        cursor.push_block(1, "old-1".into(), 32);
+        assert_eq!(cursor.history.len(), 2);
+        assert!(cursor.next_height.is_none());
+        assert!(cursor.next_hash.is_none());
+        cursor.push_block(2, "new-2".into(), 32);
+        assert_eq!(cursor.history[&2], "new-2");
+        assert!(!cursor.history.contains_key(&3));
+    }
+
+    #[tokio::test]
+    async fn test_deep_reorg_replaces_anchor_hash_at_same_height() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().join("cursor.json"));
+        cfg.log_path = Some(dir.path().join("audit.log"));
+        let genesis = audit_test_block(None, 0, 0, true);
+        let old_one = audit_test_block(Some(&genesis), 1, 0, true);
+        let new_one = audit_test_block(Some(&genesis), 1, 1, true);
+        let new_two = audit_test_block(Some(&new_one), 2, 1, true);
+        let rpc = Arc::new(MockRpc::default());
+        *rpc.consensus.lock().unwrap() = Some(mock_consensus());
+        *rpc.tip.lock().unwrap() = Some(new_two.header.clone());
+        for block in [&genesis, &new_one, &new_two] {
+            rpc.insert_block(block);
+        }
+        // Typical first-start cursor has only the old tip, so no common
+        // ancestor is available in its retained history after this reorg.
+        let mut cursor = Some(CursorState::new(
+            format!("{:#x}", H256::from([1u8; 32])),
+            1,
+            format!("{:#x}", old_one.header.hash),
+            cfg.history_retention,
+        ));
+        let auditor = Auditor::new(rpc, cfg.clone());
+        auditor.poll_once(&mut cursor).await.unwrap();
+        let state = cursor.unwrap();
+        assert_eq!(state.last_height, 2);
+        assert_eq!(state.history[&1], format!("{:#x}", new_one.header.hash));
+        assert_eq!(read_log_lines(cfg.log_path.as_ref().unwrap()).len(), 1);
+    }
+
+    struct CountingReader<R> {
+        inner: R,
+        bytes_read: usize,
+    }
+    impl<R: Read> Read for CountingReader<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.inner.read(buffer)?;
+            self.bytes_read += count;
+            Ok(count)
+        }
+    }
+    impl<R: Seek> Seek for CountingReader<R> {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(position)
+        }
+    }
+
+    #[test]
+    fn test_large_log_recovery_reads_only_tail() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(1024 * 1024 * 1024).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        writeln!(file, "\n{{\"block_hash\":\"old\",\"result\":\"PASS\"}}\n{{\"block_hash\":\"one\",\"result\":\"FAIL\"}}\n{{\"block_hash\":\"two\",\"result\":\"PASS\"}}").unwrap();
+        let mut reader = CountingReader {
+            inner: file.reopen().unwrap(),
+            bytes_read: 0,
+        };
+        let tail = read_log_tail(&mut reader, 2).unwrap();
+        assert!(reader.bytes_read <= LOG_TAIL_CHUNK_BYTES);
+        assert!(tail.len() <= LOG_TAIL_CHUNK_BYTES);
+        let window = EmittedAuditWindow::load(Some(file.path()), 2);
+        assert_eq!(window.keys.len(), 2);
+        assert_eq!(window.keys[0].block_hash, "one");
+        assert_eq!(window.keys[1].block_hash, "two");
+    }
+
+    #[test]
+    fn test_log_tail_bounds_reads_for_oversized_unterminated_record() {
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(1024 * 1024 * 1024).unwrap();
+        let mut reader = CountingReader {
+            inner: file,
+            bytes_read: 0,
+        };
+        assert!(read_log_tail(&mut reader, 256).unwrap().is_empty());
+        assert_eq!(reader.bytes_read, LOG_TAIL_MAX_BYTES);
+    }
+
+    #[test]
+    fn test_log_tail_handles_utf8_chunk_boundaries_and_partial_records() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"invalid-utf8-\xff\n").unwrap();
+        let record = json!({"block_hash": "one", "result": "FAIL", "reason": "错误".repeat(LOG_TAIL_CHUNK_BYTES)});
+        write!(
+            file,
+            "{record}\r\n{{\"block_hash\":\"two\",\"result\":\"PASS\"}}"
+        )
+        .unwrap();
+        let window = EmittedAuditWindow::load(Some(file.path()), 2);
+        assert_eq!(window.keys.len(), 2);
+        assert_eq!(window.keys[0].block_hash, "one");
+        assert_eq!(window.keys[1].block_hash, "two");
+        file.write_all(b"\n{\"block_hash\":").unwrap();
+        let window = EmittedAuditWindow::load(Some(file.path()), 3);
+        assert_eq!(window.keys.len(), 2, "ignore malformed trailing record");
     }
 
     struct ManualRpcClock {
@@ -5549,6 +5740,21 @@ mod tests {
         }
         async fn get_block_by_number(&self, number: u64) -> Result<Option<BlockView>> {
             self.bump("get_block_by_number");
+            let mut reorg = self.reorg_on_block.lock().unwrap();
+            if reorg.as_ref().is_some_and(|(height, _)| *height == number) {
+                for block in reorg.take().unwrap().1 {
+                    let height = block.header.inner.number.value();
+                    self.headers_by_number
+                        .lock()
+                        .unwrap()
+                        .insert(height, block.header.clone());
+                    self.headers_by_hash
+                        .lock()
+                        .unwrap()
+                        .insert(format!("{:#x}", block.header.hash), block.header.clone());
+                    self.blocks_by_number.lock().unwrap().insert(height, block);
+                }
+            }
             Ok(self.blocks_by_number.lock().unwrap().get(&number).cloned())
         }
         async fn get_transaction(
@@ -7489,21 +7695,26 @@ mod tests {
         let auditor = Auditor::new(rpc, cfg);
         let log = auditor.audit_block(&block_json).await;
         let serialized = serde_json::to_value(&log).unwrap();
-        assert_eq!(log.check_input_content_resolution, CheckStatus::Fail);
-        assert_eq!(log.check_input_output_index, CheckStatus::Fail);
-        assert_eq!(log.check_ordinary_capacity_conservation, CheckStatus::Fail);
-        assert_eq!(log.check_dao_withdraw_capacity, CheckStatus::Fail);
+        assert!(!log.audit_complete);
+        assert_eq!(log.check_input_content_resolution, CheckStatus::Unknown);
+        assert_eq!(log.check_input_output_index, CheckStatus::Unknown);
+        assert_eq!(
+            log.check_ordinary_capacity_conservation,
+            CheckStatus::Unknown
+        );
+        assert_eq!(log.check_dao_withdraw_capacity, CheckStatus::Unknown);
         assert!(serialized.get("check_dao_withdraw_capacity").is_some());
         assert!(serialized.get("coverage").is_none());
         assert!(serialized.get("unknown_checks").is_none());
         assert!(
             log.failed_checks.as_ref().is_some_and(
-                |checks| checks.contains(&"check_input_content_resolution".to_string())
+                |checks| !checks.contains(&"check_input_content_resolution".to_string())
             )
         );
         assert!(log.details.as_ref().unwrap().iter().any(|detail| {
             detail.referenced_out_point.as_deref().is_some()
-                && detail.failure_kind == Some(FailureKind::RetryExhausted)
+                && detail.status == CheckStatus::Unknown
+                && detail.failure_kind.is_none()
         }));
     }
 
@@ -7884,7 +8095,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mixed_rule_fail_and_retry_only_outputs_final_fail_once() {
+    async fn test_mixed_rule_fail_finalizes_without_waiting_for_unknown_inputs() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("audit.log");
         let mut cfg = test_config(dir.path().join("cursor.json"));
@@ -7956,7 +8167,18 @@ mod tests {
         let auditor = Auditor::new(rpc.clone(), cfg);
         let mut cursor = None;
         auditor.poll_once(&mut cursor).await.unwrap();
-        assert!(!log_path.exists());
+        let first_lines = read_log_lines(&log_path);
+        assert_eq!(first_lines.len(), 1);
+        assert_eq!(first_lines[0]["result"], "FAIL");
+        assert_eq!(first_lines[0]["audit_complete"], false);
+        assert_eq!(first_lines[0]["check_transaction_version"], "FAIL");
+        assert_eq!(first_lines[0]["check_input_content_resolution"], "UNKNOWN");
+        assert_eq!(
+            first_lines[0]["failed_checks"],
+            json!(["check_transaction_version"])
+        );
+        assert_eq!(cursor.as_ref().unwrap().last_height, 2);
+        assert!(cursor.as_ref().unwrap().next_height.is_none());
 
         rpc.base.txs.lock().unwrap().insert(
             format!("{:#x}", prev_tx.hash()),
@@ -8129,8 +8351,9 @@ mod tests {
         assert_eq!(log.details.as_ref().unwrap().len(), 0);
         let failed_checks = log.failed_checks.as_ref().unwrap();
         assert!(failed_checks.contains(&"check_block_hash".to_string()));
-        assert!(failed_checks.contains(&"check_timestamp".to_string()));
-        assert_eq!(log.check_timestamp, CheckStatus::Fail);
+        assert!(!failed_checks.contains(&"check_timestamp".to_string()));
+        assert_eq!(log.check_timestamp, CheckStatus::Unknown);
+        assert!(!log.audit_complete);
     }
 
     #[test]
@@ -8141,11 +8364,14 @@ mod tests {
         let block_json: BlockView = block.into();
         let mut log = AuditLog::new(&test_config(PathBuf::from("/tmp/cursor.json")), &block_json);
         log.check_block_height = CheckStatus::Pass;
+        log.check_cellbase_structure = CheckStatus::Fail;
         log.check_cellbase_reward_amount = CheckStatus::Unknown;
         log.finalize(1, 0);
 
         let value = serde_json::to_value(&log).unwrap();
-        assert_eq!(value["schema_version"], 4);
+        assert_eq!(value["schema_version"], 5);
+        assert_eq!(value["audit_complete"], false);
+        assert_eq!(value["check_cellbase_reward_amount"], "UNKNOWN");
         assert!(value.get("check_block_height").is_some());
         assert!(value.get("check_block_version").is_none());
         assert!(value.get("check_cellbase_reward_amount").is_some());
