@@ -67,7 +67,7 @@ cargo build --release --locked
   --log-path ./audit-mainnet.log
 ```
 
-> 429、缺数据或其他暂时无法完成的情况不会先写一条区块 `FAIL`；该高度会保持 pending，等拿到最终结论后才输出一条最终 JSON。
+> 只有 429、缺数据等未完成情况、没有确定的规则失败时，该高度保持 pending，不输出区块 `FAIL`。只要任一检查已确定失败，就输出一条 `FAIL` 并继续后续高度；其他尚未完成的检查保留 `UNKNOWN`，同时标记 `audit_complete=false`。该块不会等待所有 RPC 恢复后再次输出。
 
 ---
 
@@ -105,16 +105,26 @@ cargo build --release --locked
 最终结果每个区块只输出**一条** JSON 行，例如：
 
 ```json
-{"timestamp":"2026-09-14T08:31:25.000Z","schema_version":4,"service":"ckb-block-auditor","auditor_version":"0.2.0","node_id":"ckb-mainnet-01","block_height":20451139,"block_hash":"0x47f6b1825527359db4a2a1b316e70c3eb419f3200df191bcd46c60866cc8a38e","parent_hash":"0xdafc14c4264dcafcf2f66571d3b9b7b31ea3a2aae9033470b2f2b421375d5e16","block_timestamp":1789374287565,"canonical_at_audit":true,"result":"PASS","audit_duration_ms":2512,"check_block_height":"PASS","check_parent_hash":"PASS","check_epoch_continuity":"PASS","check_timestamp":"PASS","check_block_size":"PASS","check_proposal_limit":"PASS","check_block_hash":"PASS","check_transaction_hashes":"PASS","check_transactions_root":"PASS","check_proposals_hash":"PASS","check_extra_hash":"PASS","check_duplicate_transactions":"PASS","check_duplicate_proposals":"PASS","check_cellbase_structure":"PASS","check_cellbase_reward_amount":"PASS","check_cellbase_reward_target":"PASS"}
+{"timestamp":"2026-09-14T08:31:25.000Z","schema_version":5,"service":"ckb-block-auditor","auditor_version":"0.2.0","node_id":"ckb-mainnet-01","block_height":20451139,"block_hash":"0x47f6b1825527359db4a2a1b316e70c3eb419f3200df191bcd46c60866cc8a38e","parent_hash":"0xdafc14c4264dcafcf2f66571d3b9b7b31ea3a2aae9033470b2f2b421375d5e16","block_timestamp":1789374287565,"canonical_at_audit":true,"result":"PASS","audit_complete":true,"audit_duration_ms":2512,"check_block_height":"PASS","check_parent_hash":"PASS","check_epoch_continuity":"PASS","check_timestamp":"PASS","check_block_size":"PASS","check_proposal_limit":"PASS","check_block_hash":"PASS","check_transaction_hashes":"PASS","check_transactions_root":"PASS","check_proposals_hash":"PASS","check_extra_hash":"PASS","check_duplicate_transactions":"PASS","check_duplicate_proposals":"PASS","check_cellbase_structure":"PASS","check_cellbase_reward_amount":"PASS","check_cellbase_reward_target":"PASS"}
 ```
 
 阅读要点：
 
-- `result`：最终只有 `PASS` / `FAIL`
+- `schema_version=5`：新增 `audit_complete`，确定失败的结果中允许保留 `UNKNOWN` 检查。
+- `result`：最终只有 `PASS` / `FAIL`；`FAIL` 表示至少一个检查已确定失败，不把缺失 RPC 数据当作规则失败。
+- `audit_complete`：所有适用检查都有结论时为 `true`；确定失败但仍有检查未完成时为 `false`。`PASS` 必须同时满足 `audit_complete=true`。
 - `check_*`：只输出本块**适用**的检查；`NotApplicable` 不写入 JSON
-- `failed_checks`：出现失败时汇总所有失败检查名
+- `failed_checks`：汇总所有确定失败的检查名，不包含 `UNKNOWN`，即使 `details` 被截断也保留完整清单
 - `details`：出现失败时给出代表性的 `error_code`、交易位置、期望值/实际值等上下文
 - `canonical_at_audit=true`：表示开始审计该高度时，当前规范块就是这条日志里的 `block_hash`
+
+### 4.1 告警、重组与重启恢复
+
+- 原有 `result = 'FAIL'` 告警条件可继续使用；`UNKNOWN` 本身不触发区块失败告警。
+- 确定失败的区块只输出一次结果，然后推进进度；`audit_complete=false` 明确说明该结果未覆盖所有检查。仅有未完成检查的区块仍保持 pending，诊断写 stderr。
+- 批量审计期间逐块检查父 hash 是否衔接已保存的进度。发现重组时停止当前批次，下一轮寻找共同祖先、丢弃旧分支的后续历史与 pending 进度，再依次审计替换块。启动时同时保留 tip 的父块作为回退锚点。超过保留窗口、找不到共同祖先时，仍按原有策略锚定到 `tip - 1` 并审计当前 tip，stderr 会输出 `reorg_beyond_retention`。
+- 重启时按 8 KiB 分块从日志尾部恢复近期去重记录，最多读取 16 MiB，不读取整个历史日志。恢复仍受 `history_retention` 行数限制；超过字节窗口、超长或损坏记录无法恢复的去重状态属于 best effort，极端情况下可能重复输出，不能据此跳过区块审计。
+- 启动从当前 tip 开始的行为不变；不启用 cursor 时，重启不补审停机期间的区块。
 
 ---
 
@@ -355,7 +365,7 @@ cargo build --release --locked
 - 普通输出容量来源：当前交易所有输出容量求和，单位 shannon。
 - PASS 条件：`ordinary_output_sum <= ordinary_input_sum`。
 - 边界说明：
-  - 如果任一输入无法解析、源块哈希为全零，或当前实现无法确定输入是否属于 DAO，区块会保留 pending，等待更多数据后再给最终结论。
+  - 如果任一输入无法解析、源块哈希为全零，或当前实现无法确定输入是否属于 DAO，相关检查保留 `UNKNOWN`。若没有其他确定失败，区块保持 pending；若已有确定失败，则输出 `FAIL` 与 `audit_complete=false`。
   - 这里的“ordinary_output_sum”按实现是**全部输出容量之和**，不会再按输出脚本二次分类。
   - 输出小于输入是允许的，差额可以作为手续费；但输入容量来自内容解析，不保证历史 live 状态，因此此项不能独立发现跨块双花。
 - 代表性失败：`OUTPUT_CAPACITY_EXCEEDS_INPUT`。
