@@ -4011,8 +4011,23 @@ impl<R: CkbRpc> Auditor<R> {
             });
         };
         let deposit_out_point = deposit_input.previous_output.clone();
+        // Use the actual phase-1 withdrawing cell. The header-hash variant
+        // assumes the withdrawing cell occupies the same capacity as the
+        // original deposit cell, which can undercount valid withdrawals when
+        // the cell's lock script (and thus occupied capacity) changes.
+        let withdrawing_out_point = current_tx
+            .inner
+            .inputs
+            .get(input_index)
+            .ok_or_else(|| ResolutionIssue {
+                status: CheckStatus::Fail,
+                error_code: "DAO_WITHDRAWING_INPUT_MISSING".to_string(),
+                reason: format!("dao withdrawing input {input_index} is missing"),
+            })?
+            .previous_output
+            .clone();
         let calculation_kind =
-            DaoWithdrawingCalculationKind::WithdrawingHeaderHash(source.block_hash.clone());
+            DaoWithdrawingCalculationKind::WithdrawingOutPoint(withdrawing_out_point);
 
         match self
             .rpc
@@ -7352,7 +7367,17 @@ mod tests {
         let calls = rpc.dao_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, format!("{:#x}:{}", deposit_tx.hash(), 0));
-        assert_eq!(calls[0].1, format!("header:{:#x}", H256::from([5u8; 32])));
+        assert_eq!(
+            calls[0].1,
+            format!(
+                "out_point:{:#x}:{}",
+                current_tx_json.inner.inputs[0].previous_output.tx_hash,
+                current_tx_json.inner.inputs[0]
+                    .previous_output
+                    .index
+                    .value()
+            )
+        );
     }
 
     #[tokio::test]
