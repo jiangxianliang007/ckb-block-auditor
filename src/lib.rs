@@ -7372,7 +7372,10 @@ mod tests {
             format!(
                 "out_point:{:#x}:{}",
                 current_tx_json.inner.inputs[0].previous_output.tx_hash,
-                current_tx_json.inner.inputs[0].previous_output.index.value()
+                current_tx_json.inner.inputs[0]
+                    .previous_output
+                    .index
+                    .value()
             )
         );
     }
