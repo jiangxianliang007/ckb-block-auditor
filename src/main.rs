@@ -115,12 +115,8 @@ mod tests {
 
     #[test]
     fn test_cli_accepts_single_block_height() {
-        let args = Args::try_parse_from([
-            "ckb-block-auditor",
-            "--block-height",
-            "20764318",
-        ])
-        .unwrap();
+        let args =
+            Args::try_parse_from(["ckb-block-auditor", "--block-height", "20764318"]).unwrap();
         assert_eq!(args.block_height, Some(20764318));
         assert!(args.cursor_path.is_none());
     }
