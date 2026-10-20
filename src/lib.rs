@@ -1647,6 +1647,30 @@ impl<R: CkbRpc> Auditor<R> {
         }
     }
 
+    /// Audit exactly one historical block without reading or updating a cursor.
+    pub async fn run_single_block(&self, height: u64) -> Result<()> {
+        let consensus = self
+            .consensus()
+            .await
+            .context("consensus prerequisite failed")?;
+        let outcome = self
+            .audit_height_with_retries(height, &consensus)
+            .await?
+            .ok_or_else(|| anyhow!("block {height} is unavailable from RPC"))?;
+        match outcome {
+            HeightAuditOutcome::Finalized { log, .. } => {
+                self.sink.write_json_line(&serde_json::to_string(&log)?)?;
+                Ok(())
+            }
+            HeightAuditOutcome::Pending { log, .. } => {
+                self.sink.write_json_line(&serde_json::to_string(&log)?)?;
+                Err(anyhow!(
+                    "block {height} audit is incomplete; check UNKNOWN fields and RPC availability"
+                ))
+            }
+        }
+    }
+
     pub async fn run(&self) -> Result<()> {
         let mut cursor = self.load_cursor().await?;
         loop {

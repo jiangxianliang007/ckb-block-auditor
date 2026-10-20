@@ -1,6 +1,6 @@
 # ckb-block-auditor
 
-CKB Block Auditor（当前 crate 版本 `0.2.1`）是一个**只读**的 CKB JSON-RPC 区块审计工具：它从节点读取规范链区块与相关上下文，针对当前版本**已经实现**的规则做校验，并输出单行 JSON，方便接入日志采集、告警或离线复核。
+CKB Block Auditor（当前 crate 版本 `0.2.2`）是一个**只读**的 CKB JSON-RPC 区块审计工具：它从节点读取规范链区块与相关上下文，针对当前版本**已经实现**的规则做校验，并输出单行 JSON，方便接入日志采集、告警或离线复核。
 
 `PASS` 只表示：该区块在**本工具当前已实现且适用**的检查项上全部通过，并且这些检查都拿到了最终结论。
 
@@ -71,6 +71,18 @@ cargo build --release --locked
 
 ---
 
+### 2.5 单区块审计（v0.2.2）
+
+指定 `--block-height` 后只审计该高度一次，输出单条 JSON 并退出，无需 cursor，也不会进入持续轮询：
+
+```bash
+ckb-block-auditor --rpc-url http://127.0.0.1:8114 --block-height 20764318
+```
+
+可选 `--log-path` 将 JSON 写到指定文件。单区块模式不能与 `--cursor-path` 同时使用；RPC 或前置数据缺失时会输出未完成的诊断记录并以非零状态退出。此模式不会修改生产 cursor。
+
+---
+
 ## 3. 配置说明
 
 | 参数 | 环境变量 | 默认值 | 单位 | 当前含义 |
@@ -83,6 +95,7 @@ cargo build --release --locked
 | `--rpc-min-interval-ms` | `CKB_RPC_MIN_INTERVAL_MS` | `100` | ms | 全局请求最小间隔（所有方法/重试/并发共享），用于平滑主动限速 |
 | `--rpc-max-interval-ms` | `CKB_RPC_MAX_INTERVAL_MS` | `2000` | ms | 自适应降速上限；遇到 429 会在该上限内放慢，持续成功后逐步恢复 |
 | `--rpc-max-concurrency` | `CKB_RPC_MAX_CONCURRENCY` | `2` | 请求数 | 全局并发上限（所有方法共享），避免恢复时瞬时并发突发 |
+| `--block-height` | 无 | 不指定 | 区块高度 | 单次审计指定区块后退出，与 cursor 模式互斥 |
 | `--cursor-path` | `CKB_CURSOR_PATH` | 无 | 路径 | 启用持久化 cursor；不传则只保留进程内状态 |
 | `--log-path` | `CKB_LOG_PATH` | 无 | 路径 | 最终审计 JSON 输出文件；不传则输出到 stdout |
 | `--max-details` | `CKB_MAX_DETAILS` | `200` | 条 | 每条最终日志最多保留多少条 `details`；`failed_checks` 仍保持完整 |
@@ -105,7 +118,7 @@ cargo build --release --locked
 最终结果每个区块只输出**一条** JSON 行，例如：
 
 ```json
-{"timestamp":"2026-09-14T08:31:25.000Z","schema_version":5,"service":"ckb-block-auditor","auditor_version":"0.2.1","node_id":"ckb-mainnet-01","block_height":20451139,"block_hash":"0x47f6b1825527359db4a2a1b316e70c3eb419f3200df191bcd46c60866cc8a38e","parent_hash":"0xdafc14c4264dcafcf2f66571d3b9b7b31ea3a2aae9033470b2f2b421375d5e16","block_timestamp":1789374287565,"canonical_at_audit":true,"result":"PASS","audit_complete":true,"audit_duration_ms":2512,"check_block_height":"PASS","check_parent_hash":"PASS","check_epoch_continuity":"PASS","check_timestamp":"PASS","check_block_size":"PASS","check_proposal_limit":"PASS","check_block_hash":"PASS","check_transaction_hashes":"PASS","check_transactions_root":"PASS","check_proposals_hash":"PASS","check_extra_hash":"PASS","check_duplicate_transactions":"PASS","check_duplicate_proposals":"PASS","check_cellbase_structure":"PASS","check_cellbase_reward_amount":"PASS","check_cellbase_reward_target":"PASS"}
+{"timestamp":"2026-09-14T08:31:25.000Z","schema_version":5,"service":"ckb-block-auditor","auditor_version":"0.2.2","node_id":"ckb-mainnet-01","block_height":20451139,"block_hash":"0x47f6b1825527359db4a2a1b316e70c3eb419f3200df191bcd46c60866cc8a38e","parent_hash":"0xdafc14c4264dcafcf2f66571d3b9b7b31ea3a2aae9033470b2f2b421375d5e16","block_timestamp":1789374287565,"canonical_at_audit":true,"result":"PASS","audit_complete":true,"audit_duration_ms":2512,"check_block_height":"PASS","check_parent_hash":"PASS","check_epoch_continuity":"PASS","check_timestamp":"PASS","check_block_size":"PASS","check_proposal_limit":"PASS","check_block_hash":"PASS","check_transaction_hashes":"PASS","check_transactions_root":"PASS","check_proposals_hash":"PASS","check_extra_hash":"PASS","check_duplicate_transactions":"PASS","check_duplicate_proposals":"PASS","check_cellbase_structure":"PASS","check_cellbase_reward_amount":"PASS","check_cellbase_reward_target":"PASS"}
 ```
 
 阅读要点：

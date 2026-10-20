@@ -18,6 +18,8 @@ struct Args {
     rpc_timeout_secs: u64,
     #[arg(long, env = "CKB_MAX_RETRIES", default_value_t = 2)]
     max_retries: u32,
+    #[arg(long, conflicts_with = "cursor_path")]
+    block_height: Option<u64>,
     #[arg(long, env = "CKB_CURSOR_PATH")]
     cursor_path: Option<std::path::PathBuf>,
     #[arg(long, env = "CKB_LOG_PATH")]
@@ -57,6 +59,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let block_height = args.block_height;
     let cfg = AuditorConfig {
         rpc_url: args.rpc_url.clone(),
         node_id: args.node_id,
@@ -90,7 +93,11 @@ async fn main() -> anyhow::Result<()> {
         },
     )?);
     let auditor = Auditor::new(rpc, cfg);
-    auditor.run().await
+    if let Some(height) = block_height {
+        auditor.run_single_block(height).await
+    } else {
+        auditor.run().await
+    }
 }
 
 #[cfg(test)]
@@ -104,6 +111,28 @@ mod tests {
             Args::try_parse_from(["ckb-block-auditor", "--rpc-url", "http://localhost:8114"])
                 .unwrap();
         assert!(args.cursor_path.is_none());
+    }
+
+    #[test]
+    fn test_cli_accepts_single_block_height() {
+        let args =
+            Args::try_parse_from(["ckb-block-auditor", "--block-height", "20764318"]).unwrap();
+        assert_eq!(args.block_height, Some(20764318));
+        assert!(args.cursor_path.is_none());
+    }
+
+    #[test]
+    fn test_cli_rejects_cursor_with_single_block_height() {
+        assert!(
+            Args::try_parse_from([
+                "ckb-block-auditor",
+                "--block-height",
+                "20764318",
+                "--cursor-path",
+                "cursor.json",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
