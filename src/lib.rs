@@ -1649,7 +1649,10 @@ impl<R: CkbRpc> Auditor<R> {
 
     /// Audit exactly one historical block without reading or updating a cursor.
     pub async fn run_single_block(&self, height: u64) -> Result<()> {
-        let consensus = self.consensus().await.context("consensus prerequisite failed")?;
+        let consensus = self
+            .consensus()
+            .await
+            .context("consensus prerequisite failed")?;
         let outcome = self
             .audit_height_with_retries(height, &consensus)
             .await?
