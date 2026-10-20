@@ -7369,7 +7369,11 @@ mod tests {
         assert_eq!(calls[0].0, format!("{:#x}:{}", deposit_tx.hash(), 0));
         assert_eq!(
             calls[0].1,
-            format!("out_point:{:#x}:{}", withdrawing_tx.hash(), 1)
+            format!(
+                "out_point:{:#x}:{}",
+                current_tx_json.inner.inputs[0].previous_output.tx_hash,
+                current_tx_json.inner.inputs[0].previous_output.index.value()
+            )
         );
     }
 
